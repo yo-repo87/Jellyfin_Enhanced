@@ -104,6 +104,11 @@ architecture maps onto it directly.
    M3U playlists, significantly improving Live TV setup UX. Jellyfin already
    has the infrastructure (RefreshGuideScheduledTask with daily 24h interval,
    M3UTunerHost, XmlTvListingsProvider); this polish surfaces better feedback.
+8. **Bulk metadata editor** — web `14e8ea2`.
+   Dashboard page for batch-editing item properties (genres, tags, ratings)
+   across multiple selected movies/shows. Search for items, then apply common
+   metadata updates to the entire result set. UI uses library search + update
+   endpoints; live ready for dashboard integration.
 
 ### Completed features (all built clean and verified)
    Metadata lookup now survives more real-world filename pollution. Added
