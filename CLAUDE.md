@@ -96,6 +96,16 @@ architecture maps onto it directly.
    approach + its driver-bundling from the teardown); bulk metadata editor; client-app polish
    (API compat only).
 6. **Filename identification improvements** — server `9285005`.
+7. **Live TV/DVR polish** — server `b3246a5`.
+   Enhanced M3U tuner validation to check format validity (must start with
+   #EXTM3U marker) and provide helpful, actionable error messages for common
+   issues: HTTP 4xx (wrong URL), 5xx (server down), file not found, access
+   denied, invalid format. This eliminates cryptic failures when users add
+   M3U playlists, significantly improving Live TV setup UX. Jellyfin already
+   has the infrastructure (RefreshGuideScheduledTask with daily 24h interval,
+   M3UTunerHost, XmlTvListingsProvider); this polish surfaces better feedback.
+
+### Completed features (all built clean and verified)
    Metadata lookup now survives more real-world filename pollution. Added
    `GetSearchAttempts` method to generate progressive fallbacks: first tries full
    name+year, then name without year, then progressively shorter names (dropping
