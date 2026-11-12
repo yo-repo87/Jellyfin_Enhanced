@@ -1,7 +1,7 @@
 From 1371e67df3f37e620f59fbc0e0204ad2c7bfe537 Mon Sep 17 00:00:00 2001
 From: Matthew Gibson <matthew.gibson041387@gmail.com>
 Date: Wed, 11 Nov 2026 15:54:42 +0000
-Subject: [PATCH 1/5] Add 'copy settings from user' picker to the new-user page
+Subject: [PATCH 1/6] Add 'copy settings from user' picker to the new-user page
 
 When a source user is selected, library/channel access checkboxes are
 hidden and the server-side copied policy is left untouched.

@@ -1,0 +1,60 @@
+From 28d60d3a1360315620ae74a5adeee823e6f1d4ba Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <mgibson041387@gmail.com>
+Date: Thu, 12 Nov 2026 00:14:59 +0000
+Subject: [PATCH 6/6] Bulk editor: use the right SDK calls (search all
+ libraries, item update API)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dashboard/routes/metadata/bulk-editor.tsx | 21 ++++++++-----------
+ 1 file changed, 9 insertions(+), 12 deletions(-)
+
+diff --git a/src/apps/dashboard/routes/metadata/bulk-editor.tsx b/src/apps/dashboard/routes/metadata/bulk-editor.tsx
+index 03962cc..434b72a 100644
+--- a/src/apps/dashboard/routes/metadata/bulk-editor.tsx
++++ b/src/apps/dashboard/routes/metadata/bulk-editor.tsx
+@@ -17,6 +17,7 @@ import SimpleAlert from 'components/SimpleAlert';
+ import globalize from 'lib/globalize';
+ import { useApi } from 'hooks/useApi';
+ import { getLibraryApi } from '@jellyfin/sdk/lib/utils/api/library-api';
++import { getItemUpdateApi } from '@jellyfin/sdk/lib/utils/api/item-update-api';
+ import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models/base-item-dto';
+ 
+ export const Component = () => {
+@@ -38,17 +39,13 @@ export const Component = () => {
+ 
+         setIsLoading(true);
+         try {
+-            const result = await getLibraryApi(api).getMediaFolders();
+-            const libraryId = result.Items?.[0]?.Id;
+-
+-            if (libraryId) {
+-                const searchResult = await getLibraryApi(api).getItems({
+-                    parentId: libraryId,
+-                    searchTerm: query,
+-                    limit: 100
+-                });
+-                setSelectedItems(searchResult.Items || []);
+-            }
++            // Search every library, not just the first one
++            const searchResult = await getLibraryApi(api).getItems({
++                searchTerm: query,
++                recursive: true,
++                limit: 100
++            });
++            setSelectedItems(searchResult.data.Items || []);
+         } catch (err) {
+             console.error('[BulkMetadataEditor] search failed', err);
+         } finally {
+@@ -78,7 +75,7 @@ export const Component = () => {
+                 }
+ 
+                 if (Object.keys(updatesObj).length > 0) {
+-                    await getLibraryApi(api).updateItem({ itemId: item.Id!, body: { ...item, ...updatesObj } });
++                    await getItemUpdateApi(api).updateItem({ itemId: item.Id!, baseItemDto: { ...item, ...updatesObj } });
+                 }
+             }
+ 
+-- 
+2.53.0
+

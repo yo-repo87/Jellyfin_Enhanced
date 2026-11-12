@@ -1,7 +1,7 @@
 From 53941eae8be32e601557d5a0d2a59a25e775f2f1 Mon Sep 17 00:00:00 2001
 From: Matthew Gibson <mgibson041387@gmail.com>
 Date: Wed, 11 Nov 2026 17:08:38 +0000
-Subject: [PATCH 4/5] Add automatic backup settings to the backups page
+Subject: [PATCH 4/6] Add automatic backup settings to the backups page
 
 New 'Automatic Backups' section on the dashboard backups page for the
 scheduled backup task: retention count and backup content, saved to the

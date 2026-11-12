@@ -1,7 +1,7 @@
 From 14e8ea245e6f1078b762ead9731d417499866315 Mon Sep 17 00:00:00 2001
 From: Matthew Gibson <mgibson041387@gmail.com>
 Date: Wed, 11 Nov 2026 23:24:54 +0000
-Subject: [PATCH 5/5] Add bulk metadata editor for batch editing item
+Subject: [PATCH 5/6] Add bulk metadata editor for batch editing item
  properties
 
 New dashboard page for bulk editing movie/show metadata: search items,
