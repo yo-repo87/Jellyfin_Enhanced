@@ -1,0 +1,423 @@
+From 3fbc6b0562ce99c5a7e54bebeb686d10e1a8debe Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <mgibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 16:46:09 +0000
+Subject: [PATCH 3/7] Add automatic version merging for movie libraries
+
+Emby-style behavior: a new per-library option EnableAutomaticVersionMerging
+causes a post-scan task to merge movies with the same name and production
+year into one item with multiple versions, even across library folders.
+The merge logic moves from VideosController into a shared
+IVideoVersionManager used by both the endpoint and the post-scan task.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../ApplicationHost.cs                        |   1 +
+ .../AutomaticVersionMergingPostScanTask.cs    | 129 ++++++++++++++++++
+ .../Library/VideoVersionManager.cs            | 104 ++++++++++++++
+ Jellyfin.Api/Controllers/VideosController.cs  |  61 +--------
+ .../Library/IVideoVersionManager.cs           |  21 +++
+ .../Configuration/LibraryOptions.cs           |   7 +
+ 6 files changed, 268 insertions(+), 55 deletions(-)
+ create mode 100644 Emby.Server.Implementations/Library/AutomaticVersionMergingPostScanTask.cs
+ create mode 100644 Emby.Server.Implementations/Library/VideoVersionManager.cs
+ create mode 100644 MediaBrowser.Controller/Library/IVideoVersionManager.cs
+
+diff --git a/Emby.Server.Implementations/ApplicationHost.cs b/Emby.Server.Implementations/ApplicationHost.cs
+index 1a54565..803d912 100644
+--- a/Emby.Server.Implementations/ApplicationHost.cs
++++ b/Emby.Server.Implementations/ApplicationHost.cs
+@@ -608,6 +608,7 @@ namespace Emby.Server.Implementations
+             serviceCollection.AddSingleton<ISessionManager, SessionManager>();
+ 
+             serviceCollection.AddSingleton<ICollectionManager, CollectionManager>();
++            serviceCollection.AddSingleton<IVideoVersionManager, VideoVersionManager>();
+             serviceCollection.AddSingleton<ILimitedConcurrencyLibraryScheduler, LimitedConcurrencyLibraryScheduler>();
+ 
+             serviceCollection.AddSingleton<IPlaylistManager, PlaylistManager>();
+diff --git a/Emby.Server.Implementations/Library/AutomaticVersionMergingPostScanTask.cs b/Emby.Server.Implementations/Library/AutomaticVersionMergingPostScanTask.cs
+new file mode 100644
+index 0000000..80d99fa
+--- /dev/null
++++ b/Emby.Server.Implementations/Library/AutomaticVersionMergingPostScanTask.cs
+@@ -0,0 +1,129 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Threading;
++using System.Threading.Tasks;
++using Jellyfin.Data.Enums;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.Entities.Movies;
++using MediaBrowser.Controller.Library;
++using Microsoft.Extensions.Logging;
++
++namespace Emby.Server.Implementations.Library;
++
++/// <summary>
++/// Post scan task that merges videos with the same name and production year into one
++/// item with multiple versions, for libraries that have automatic version merging enabled.
++/// </summary>
++public class AutomaticVersionMergingPostScanTask : ILibraryPostScanTask
++{
++    private readonly ILibraryManager _libraryManager;
++    private readonly IVideoVersionManager _videoVersionManager;
++    private readonly ILogger<AutomaticVersionMergingPostScanTask> _logger;
++
++    /// <summary>
++    /// Initializes a new instance of the <see cref="AutomaticVersionMergingPostScanTask"/> class.
++    /// </summary>
++    /// <param name="libraryManager">Instance of the <see cref="ILibraryManager"/> interface.</param>
++    /// <param name="videoVersionManager">Instance of the <see cref="IVideoVersionManager"/> interface.</param>
++    /// <param name="logger">Instance of the <see cref="ILogger{AutomaticVersionMergingPostScanTask}"/> interface.</param>
++    public AutomaticVersionMergingPostScanTask(
++        ILibraryManager libraryManager,
++        IVideoVersionManager videoVersionManager,
++        ILogger<AutomaticVersionMergingPostScanTask> logger)
++    {
++        _libraryManager = libraryManager;
++        _videoVersionManager = videoVersionManager;
++        _logger = logger;
++    }
++
++    /// <summary>
++    /// Runs the task.
++    /// </summary>
++    /// <param name="progress">The progress.</param>
++    /// <param name="cancellationToken">The cancellation token.</param>
++    /// <returns>Task.</returns>
++    public async Task Run(IProgress<double> progress, CancellationToken cancellationToken)
++    {
++        var libraries = _libraryManager.GetUserRootFolder().Children
++            .OfType<CollectionFolder>()
++            .Where(i => i.GetLibraryOptions().EnableAutomaticVersionMerging)
++            .ToList();
++
++        var processedLibraries = 0;
++        foreach (var library in libraries)
++        {
++            cancellationToken.ThrowIfCancellationRequested();
++
++            await MergeDuplicatesInLibrary(library, cancellationToken).ConfigureAwait(false);
++
++            processedLibraries++;
++            progress.Report((double)processedLibraries / libraries.Count * 100);
++        }
++
++        progress.Report(100);
++    }
++
++    private async Task MergeDuplicatesInLibrary(CollectionFolder library, CancellationToken cancellationToken)
++    {
++        var movies = _libraryManager.GetItemList(new InternalItemsQuery
++        {
++            IncludeItemTypes = [BaseItemKind.Movie],
++            Recursive = true,
++            Parent = library
++        }).OfType<Movie>();
++
++        // Resolve each movie to the root of its version family so items that are
++        // already merged are considered one unit.
++        var families = new Dictionary<Guid, Video>();
++        foreach (var movie in movies)
++        {
++            var root = movie.PrimaryVersionId.HasValue
++                ? _libraryManager.GetItemById(movie.PrimaryVersionId.Value) as Video ?? movie
++                : movie;
++            families[root.Id] = root;
++        }
++
++        var groups = families.Values
++            .Where(i => !string.IsNullOrEmpty(i.Name) && i.ProductionYear.HasValue)
++            .GroupBy(i => (Name: i.Name.Trim(), Year: i.ProductionYear!.Value), StringTupleComparer.Instance)
++            .Where(g => g.Count() > 1);
++
++        foreach (var group in groups)
++        {
++            cancellationToken.ThrowIfCancellationRequested();
++
++            var items = group.OrderBy(i => i.Id).ToList<Video>();
++            _logger.LogInformation(
++                "Automatically merging {Count} versions of {Name} ({Year}) in library {Library}",
++                items.Count,
++                group.Key.Name,
++                group.Key.Year,
++                library.Name);
++
++            try
++            {
++                await _videoVersionManager.MergeVersionsAsync(items, cancellationToken).ConfigureAwait(false);
++            }
++            catch (OperationCanceledException)
++            {
++                throw;
++            }
++            catch (Exception ex)
++            {
++                _logger.LogError(ex, "Failed to automatically merge versions of {Name} ({Year})", group.Key.Name, group.Key.Year);
++            }
++        }
++    }
++
++    private sealed class StringTupleComparer : IEqualityComparer<(string Name, int Year)>
++    {
++        public static readonly StringTupleComparer Instance = new();
++
++        public bool Equals((string Name, int Year) x, (string Name, int Year) y)
++            => x.Year == y.Year && string.Equals(x.Name, y.Name, StringComparison.OrdinalIgnoreCase);
++
++        public int GetHashCode((string Name, int Year) obj)
++            => HashCode.Combine(obj.Name.ToUpperInvariant(), obj.Year);
++    }
++}
+diff --git a/Emby.Server.Implementations/Library/VideoVersionManager.cs b/Emby.Server.Implementations/Library/VideoVersionManager.cs
+new file mode 100644
+index 0000000..e388c6d
+--- /dev/null
++++ b/Emby.Server.Implementations/Library/VideoVersionManager.cs
+@@ -0,0 +1,104 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Threading;
++using System.Threading.Tasks;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Model.Entities;
++using Microsoft.Extensions.Logging;
++
++namespace Emby.Server.Implementations.Library
++{
++    /// <summary>
++    /// Default implementation of <see cref="IVideoVersionManager"/>.
++    /// </summary>
++    public class VideoVersionManager : IVideoVersionManager
++    {
++        private readonly ILibraryManager _libraryManager;
++        private readonly ILogger<VideoVersionManager> _logger;
++
++        /// <summary>
++        /// Initializes a new instance of the <see cref="VideoVersionManager"/> class.
++        /// </summary>
++        /// <param name="libraryManager">Instance of the <see cref="ILibraryManager"/> interface.</param>
++        /// <param name="logger">Instance of the <see cref="ILogger{VideoVersionManager}"/> interface.</param>
++        public VideoVersionManager(ILibraryManager libraryManager, ILogger<VideoVersionManager> logger)
++        {
++            _libraryManager = libraryManager;
++            _logger = logger;
++        }
++
++        /// <inheritdoc />
++        public async Task MergeVersionsAsync(IReadOnlyList<Video> items, CancellationToken cancellationToken)
++        {
++            if (items.Count < 2)
++            {
++                throw new ArgumentException("At least two videos are required to merge.", nameof(items));
++            }
++
++            var primaryVersion = items.FirstOrDefault(i => i.MediaSourceCount > 1 && !i.PrimaryVersionId.HasValue);
++            if (primaryVersion is null)
++            {
++                primaryVersion = items
++                    .OrderBy(i =>
++                    {
++                        if (i.Video3DFormat.HasValue || i.VideoType != VideoType.VideoFile)
++                        {
++                            return 1;
++                        }
++
++                        return 0;
++                    })
++                    .ThenByDescending(i => i.GetDefaultVideoStream()?.Width ?? 0)
++                    .First();
++            }
++
++            _logger.LogInformation(
++                "Merging {Count} videos into primary version {Name} ({Id})",
++                items.Count,
++                primaryVersion.Name,
++                primaryVersion.Id);
++
++            var alternateVersionsOfPrimary = primaryVersion.LinkedAlternateVersions.ToList();
++
++            foreach (var item in items.Where(i => !i.Id.Equals(primaryVersion.Id)))
++            {
++                cancellationToken.ThrowIfCancellationRequested();
++
++                item.SetPrimaryVersionId(primaryVersion.Id);
++
++                await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
++
++                // Re-route any playlist/collection references from this item to the primary
++                await _libraryManager.RerouteLinkedChildReferencesAsync(item.Id, primaryVersion.Id).ConfigureAwait(false);
++
++                if (!alternateVersionsOfPrimary.Any(i => i.ItemId.HasValue && i.ItemId.Value.Equals(item.Id)))
++                {
++                    alternateVersionsOfPrimary.Add(new LinkedChild
++                    {
++                        ItemId = item.Id,
++                        Type = LinkedChildType.LinkedAlternateVersion
++                    });
++                }
++
++                foreach (var linkedItem in item.LinkedAlternateVersions)
++                {
++                    if (linkedItem.ItemId.HasValue && !alternateVersionsOfPrimary.Any(i => i.ItemId.HasValue && i.ItemId.Value.Equals(linkedItem.ItemId.Value)))
++                    {
++                        alternateVersionsOfPrimary.Add(linkedItem);
++                    }
++                }
++
++                if (item.LinkedAlternateVersions.Length > 0)
++                {
++                    item.LinkedAlternateVersions = Array.Empty<LinkedChild>();
++                    await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
++                }
++            }
++
++            primaryVersion.LinkedAlternateVersions = alternateVersionsOfPrimary.ToArray();
++            await primaryVersion.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
++        }
++    }
++}
+diff --git a/Jellyfin.Api/Controllers/VideosController.cs b/Jellyfin.Api/Controllers/VideosController.cs
+index 29a92cd..bd18c59 100644
+--- a/Jellyfin.Api/Controllers/VideosController.cs
++++ b/Jellyfin.Api/Controllers/VideosController.cs
+@@ -39,6 +39,7 @@ namespace Jellyfin.Api.Controllers;
+ public class VideosController : BaseJellyfinApiController
+ {
+     private readonly ILibraryManager _libraryManager;
++    private readonly IVideoVersionManager _videoVersionManager;
+     private readonly IUserManager _userManager;
+     private readonly IDtoService _dtoService;
+     private readonly IMediaSourceManager _mediaSourceManager;
+@@ -62,6 +63,7 @@ public class VideosController : BaseJellyfinApiController
+     /// <param name="transcodeManager">Instance of the <see cref="ITranscodeManager"/> interface.</param>
+     /// <param name="httpClientFactory">Instance of the <see cref="IHttpClientFactory"/> interface.</param>
+     /// <param name="encodingHelper">Instance of <see cref="EncodingHelper"/>.</param>
++    /// <param name="videoVersionManager">Instance of the <see cref="IVideoVersionManager"/> interface.</param>
+     public VideosController(
+         ILibraryManager libraryManager,
+         IUserManager userManager,
+@@ -71,8 +73,10 @@ public class VideosController : BaseJellyfinApiController
+         IMediaEncoder mediaEncoder,
+         ITranscodeManager transcodeManager,
+         IHttpClientFactory httpClientFactory,
+-        EncodingHelper encodingHelper)
++        EncodingHelper encodingHelper,
++        IVideoVersionManager videoVersionManager)
+     {
++        _videoVersionManager = videoVersionManager;
+         _libraryManager = libraryManager;
+         _userManager = userManager;
+         _dtoService = dtoService;
+@@ -198,60 +202,7 @@ public class VideosController : BaseJellyfinApiController
+             return BadRequest("Please supply at least two videos to merge.");
+         }
+ 
+-        var primaryVersion = items.FirstOrDefault(i => i.MediaSourceCount > 1 && !i.PrimaryVersionId.HasValue);
+-        if (primaryVersion is null)
+-        {
+-            primaryVersion = items
+-                .OrderBy(i =>
+-                {
+-                    if (i.Video3DFormat.HasValue || i.VideoType != VideoType.VideoFile)
+-                    {
+-                        return 1;
+-                    }
+-
+-                    return 0;
+-                })
+-                .ThenByDescending(i => i.GetDefaultVideoStream()?.Width ?? 0)
+-                .First();
+-        }
+-
+-        var alternateVersionsOfPrimary = primaryVersion.LinkedAlternateVersions.ToList();
+-
+-        foreach (var item in items.Where(i => !i.Id.Equals(primaryVersion.Id)))
+-        {
+-            item.SetPrimaryVersionId(primaryVersion.Id);
+-
+-            await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, CancellationToken.None).ConfigureAwait(false);
+-
+-            // Re-route any playlist/collection references from this item to the primary
+-            await _libraryManager.RerouteLinkedChildReferencesAsync(item.Id, primaryVersion.Id).ConfigureAwait(false);
+-
+-            if (!alternateVersionsOfPrimary.Any(i => i.ItemId.HasValue && i.ItemId.Value.Equals(item.Id)))
+-            {
+-                alternateVersionsOfPrimary.Add(new LinkedChild
+-                {
+-                    ItemId = item.Id,
+-                    Type = LinkedChildType.LinkedAlternateVersion
+-                });
+-            }
+-
+-            foreach (var linkedItem in item.LinkedAlternateVersions)
+-            {
+-                if (linkedItem.ItemId.HasValue && !alternateVersionsOfPrimary.Any(i => i.ItemId.HasValue && i.ItemId.Value.Equals(linkedItem.ItemId.Value)))
+-                {
+-                    alternateVersionsOfPrimary.Add(linkedItem);
+-                }
+-            }
+-
+-            if (item.LinkedAlternateVersions.Length > 0)
+-            {
+-                item.LinkedAlternateVersions = Array.Empty<LinkedChild>();
+-                await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, CancellationToken.None).ConfigureAwait(false);
+-            }
+-        }
+-
+-        primaryVersion.LinkedAlternateVersions = alternateVersionsOfPrimary.ToArray();
+-        await primaryVersion.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, CancellationToken.None).ConfigureAwait(false);
++        await _videoVersionManager.MergeVersionsAsync(items, CancellationToken.None).ConfigureAwait(false);
+         return NoContent();
+     }
+ 
+diff --git a/MediaBrowser.Controller/Library/IVideoVersionManager.cs b/MediaBrowser.Controller/Library/IVideoVersionManager.cs
+new file mode 100644
+index 0000000..835432d
+--- /dev/null
++++ b/MediaBrowser.Controller/Library/IVideoVersionManager.cs
+@@ -0,0 +1,21 @@
++using System.Collections.Generic;
++using System.Threading;
++using System.Threading.Tasks;
++using MediaBrowser.Controller.Entities;
++
++namespace MediaBrowser.Controller.Library
++{
++    /// <summary>
++    /// Service for linking videos together as alternate versions of one item.
++    /// </summary>
++    public interface IVideoVersionManager
++    {
++        /// <summary>
++        /// Merges the given videos into a single record with multiple versions.
++        /// </summary>
++        /// <param name="items">The videos to merge. Requires at least two items; the primary version is selected automatically.</param>
++        /// <param name="cancellationToken">The cancellation token.</param>
++        /// <returns>A task representing the merge operation.</returns>
++        Task MergeVersionsAsync(IReadOnlyList<Video> items, CancellationToken cancellationToken);
++    }
++}
+diff --git a/MediaBrowser.Model/Configuration/LibraryOptions.cs b/MediaBrowser.Model/Configuration/LibraryOptions.cs
+index 590b743..afba603 100644
+--- a/MediaBrowser.Model/Configuration/LibraryOptions.cs
++++ b/MediaBrowser.Model/Configuration/LibraryOptions.cs
+@@ -65,6 +65,13 @@ namespace MediaBrowser.Model.Configuration
+ 
+         public bool EnableAutomaticSeriesGrouping { get; set; }
+ 
++        /// <summary>
++        /// Gets or sets a value indicating whether videos in this library with the same
++        /// name and production year are automatically merged into one item with
++        /// multiple versions after each library scan.
++        /// </summary>
++        public bool EnableAutomaticVersionMerging { get; set; }
++
+         public bool EnableEmbeddedTitles { get; set; }
+ 
+         public bool EnableEmbeddedExtrasTitles { get; set; }
+-- 
+2.53.0
+

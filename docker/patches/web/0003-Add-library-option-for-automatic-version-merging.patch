@@ -1,0 +1,78 @@
+From 2c89cf9d7e4c399f60db946f4d3a0679cdea94ec Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <mgibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 16:46:09 +0000
+Subject: [PATCH 3/5] Add library option for automatic version merging
+
+Checkbox in library settings (movies/mixed) bound to the server's new
+EnableAutomaticVersionMerging library option.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../libraryoptionseditor/libraryoptionseditor.js          | 3 +++
+ .../libraryoptionseditor.template.html                    | 8 ++++++++
+ src/strings/en-us.json                                    | 2 ++
+ 3 files changed, 13 insertions(+)
+
+diff --git a/src/components/libraryoptionseditor/libraryoptionseditor.js b/src/components/libraryoptionseditor/libraryoptionseditor.js
+index d61d534..c0810fc 100644
+--- a/src/components/libraryoptionseditor/libraryoptionseditor.js
++++ b/src/components/libraryoptionseditor/libraryoptionseditor.js
+@@ -575,6 +575,7 @@ export function setContentType(parent, contentType) {
+     }
+ 
+     parent.querySelector('.chkAutomaticallyAddToCollectionContainer').classList.toggle('hide', contentType !== 'movies' && contentType !== 'mixed');
++    parent.querySelector('.chkAutomaticVersionMergingContainer').classList.toggle('hide', contentType !== 'movies' && contentType !== 'mixed');
+ 
+     return populateMetadataSettings(parent, contentType);
+ }
+@@ -732,6 +733,7 @@ export function getLibraryOptions(parent) {
+         SaveLyricsWithMedia: parent.querySelector('#chkSaveLyricsLocally').checked,
+         RequirePerfectSubtitleMatch: parent.querySelector('#chkRequirePerfectMatch').checked,
+         AutomaticallyAddToCollection: parent.querySelector('#chkAutomaticallyAddToCollection').checked,
++        EnableAutomaticVersionMerging: parent.querySelector('#chkAutomaticVersionMerging').checked,
+         PreferNonstandardArtistsTag: parent.querySelector('#chkPreferNonstandardArtistsTag').checked,
+         UseCustomTagDelimiters: parent.querySelector('#chkUseCustomTagDelimiters').checked,
+         MetadataSavers: Array.prototype.map.call(Array.prototype.filter.call(parent.querySelectorAll('.chkMetadataSaver'), elem => {
+@@ -802,6 +804,7 @@ export function setLibraryOptions(parent, options) {
+     parent.querySelector('#chkSkipIfAudioTrackPresent').checked = options.SkipSubtitlesIfAudioTrackMatches;
+     parent.querySelector('#chkRequirePerfectMatch').checked = options.RequirePerfectSubtitleMatch;
+     parent.querySelector('#chkAutomaticallyAddToCollection').checked = options.AutomaticallyAddToCollection;
++    parent.querySelector('#chkAutomaticVersionMerging').checked = !!options.EnableAutomaticVersionMerging;
+     parent.querySelector('#chkPreferNonstandardArtistsTag').checked = options.PreferNonstandardArtistsTag;
+     parent.querySelector('#chkUseCustomTagDelimiters').checked = options.UseCustomTagDelimiters;
+     Array.prototype.forEach.call(parent.querySelectorAll('.chkMetadataSaver'), elem => {
+diff --git a/src/components/libraryoptionseditor/libraryoptionseditor.template.html b/src/components/libraryoptionseditor/libraryoptionseditor.template.html
+index 61b801c..dfb9729 100644
+--- a/src/components/libraryoptionseditor/libraryoptionseditor.template.html
++++ b/src/components/libraryoptionseditor/libraryoptionseditor.template.html
+@@ -79,6 +79,14 @@ <h2>${HeaderLibrarySettings}</h2>
+     <div class="fieldDescription checkboxFieldDescription">${LabelAutomaticallyAddToCollectionHelp}</div>
+ </div>
+ 
++<div class="checkboxContainer checkboxContainer-withDescription chkAutomaticVersionMergingContainer hide advanced">
++    <label>
++        <input is="emby-checkbox" type="checkbox" id="chkAutomaticVersionMerging" />
++        <span>${LabelAutomaticVersionMerging}</span>
++    </label>
++    <div class="fieldDescription checkboxFieldDescription">${LabelAutomaticVersionMergingHelp}</div>
++</div>
++
+ <div class="metadataReaders hide advanced" style="margin-bottom: 2em;">
+ </div>
+ 
+diff --git a/src/strings/en-us.json b/src/strings/en-us.json
+index f4bd381..563d647 100755
+--- a/src/strings/en-us.json
++++ b/src/strings/en-us.json
+@@ -660,6 +660,8 @@
+     "LabelAuthProvider": "Authentication Provider",
+     "LabelAutomaticallyAddToCollection": "Automatically add to collection",
+     "LabelAutomaticallyAddToCollectionHelp": "When at least 2 movies have the same collection name, they will be automatically added to the collection.",
++    "LabelAutomaticVersionMerging": "Automatically merge versions of the same item",
++    "LabelAutomaticVersionMergingHelp": "After each library scan, movies with the same name and production year are merged into one item with multiple versions, even when they are stored in different folders.",
+     "LabelAutomaticallyRefreshInternetMetadataEvery": "Automatically refresh metadata from the internet",
+     "LabelAutomaticDiscovery": "Enable Auto Discovery",
+     "LabelAutomaticDiscoveryHelp": "Allow applications to automatically detect Jellyfin by using UDP port 7359.",
+-- 
+2.53.0
+

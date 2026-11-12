@@ -1,0 +1,235 @@
+From 6f9ae835c602966ae0f4513746feeb3183bcd6c7 Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <mgibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 17:08:38 +0000
+Subject: [PATCH 5/7] Add scheduled backup task with retention
+
+New 'Create Backup' scheduled task (daily at 3:00 by default) that runs the
+existing backup service and then deletes the oldest backups beyond the
+configured retention count. Options (retention and backup content) live in
+a new 'scheduledbackup' configuration store, editable via
+/System/Configuration/scheduledbackup.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../Localization/Core/en-US.json              |   2 +
+ .../Tasks/BackupConfigurationFactory.cs       |  25 ++++
+ .../ScheduledTasks/Tasks/BackupTask.cs        | 119 ++++++++++++++++++
+ .../Configuration/ScheduledBackupOptions.cs   |  35 ++++++
+ 4 files changed, 181 insertions(+)
+ create mode 100644 Emby.Server.Implementations/ScheduledTasks/Tasks/BackupConfigurationFactory.cs
+ create mode 100644 Emby.Server.Implementations/ScheduledTasks/Tasks/BackupTask.cs
+ create mode 100644 MediaBrowser.Model/Configuration/ScheduledBackupOptions.cs
+
+diff --git a/Emby.Server.Implementations/Localization/Core/en-US.json b/Emby.Server.Implementations/Localization/Core/en-US.json
+index 578c85d..e44ed9a 100644
+--- a/Emby.Server.Implementations/Localization/Core/en-US.json
++++ b/Emby.Server.Implementations/Localization/Core/en-US.json
+@@ -112,6 +112,8 @@
+     "TaskDownloadMissingLyricsDescription": "Downloads lyrics for songs",
+     "TaskDownloadMissingSubtitles": "Download missing subtitles",
+     "TaskDownloadMissingSubtitlesDescription": "Searches the internet for missing subtitles based on metadata configuration.",
++    "TaskBackup": "Create Backup",
++    "TaskBackupDescription": "Creates a backup of the server configuration in the backup folder and removes old backups beyond the configured retention count.",
+     "TaskOptimizeDatabase": "Optimize database",
+     "TaskOptimizeDatabaseDescription": "Compacts database and truncates free space. Running this task after scanning the library or doing other changes that imply database modifications might improve performance.",
+     "TaskKeyframeExtractor": "Keyframe Extractor",
+diff --git a/Emby.Server.Implementations/ScheduledTasks/Tasks/BackupConfigurationFactory.cs b/Emby.Server.Implementations/ScheduledTasks/Tasks/BackupConfigurationFactory.cs
+new file mode 100644
+index 0000000..a523d58
+--- /dev/null
++++ b/Emby.Server.Implementations/ScheduledTasks/Tasks/BackupConfigurationFactory.cs
+@@ -0,0 +1,25 @@
++using System.Collections.Generic;
++using MediaBrowser.Common.Configuration;
++using MediaBrowser.Model.Configuration;
++
++namespace Emby.Server.Implementations.ScheduledTasks.Tasks
++{
++    /// <summary>
++    /// A configuration factory for <see cref="ScheduledBackupOptions"/>.
++    /// </summary>
++    public class BackupConfigurationFactory : IConfigurationFactory
++    {
++        /// <inheritdoc />
++        public IEnumerable<ConfigurationStore> GetConfigurations()
++        {
++            return new[]
++            {
++                new ConfigurationStore
++                {
++                    ConfigurationType = typeof(ScheduledBackupOptions),
++                    Key = "scheduledbackup"
++                }
++            };
++        }
++    }
++}
+diff --git a/Emby.Server.Implementations/ScheduledTasks/Tasks/BackupTask.cs b/Emby.Server.Implementations/ScheduledTasks/Tasks/BackupTask.cs
+new file mode 100644
+index 0000000..3b4dd15
+--- /dev/null
++++ b/Emby.Server.Implementations/ScheduledTasks/Tasks/BackupTask.cs
+@@ -0,0 +1,119 @@
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Threading;
++using System.Threading.Tasks;
++using Jellyfin.Server.Implementations.SystemBackupService;
++using MediaBrowser.Common.Configuration;
++using MediaBrowser.Controller.SystemBackupService;
++using MediaBrowser.Model.Configuration;
++using MediaBrowser.Model.Globalization;
++using MediaBrowser.Model.Tasks;
++using Microsoft.Extensions.Logging;
++
++namespace Emby.Server.Implementations.ScheduledTasks.Tasks;
++
++/// <summary>
++/// Creates a backup of the server configuration on a schedule and prunes old
++/// backups beyond the configured retention count.
++/// </summary>
++public class BackupTask : IScheduledTask, IConfigurableScheduledTask
++{
++    private readonly ILogger<BackupTask> _logger;
++    private readonly ILocalizationManager _localization;
++    private readonly IBackupService _backupService;
++    private readonly IConfigurationManager _configurationManager;
++
++    /// <summary>
++    /// Initializes a new instance of the <see cref="BackupTask" /> class.
++    /// </summary>
++    /// <param name="logger">Instance of the <see cref="ILogger"/> interface.</param>
++    /// <param name="localization">Instance of the <see cref="ILocalizationManager"/> interface.</param>
++    /// <param name="backupService">Instance of the <see cref="IBackupService"/> interface.</param>
++    /// <param name="configurationManager">Instance of the <see cref="IConfigurationManager"/> interface.</param>
++    public BackupTask(
++        ILogger<BackupTask> logger,
++        ILocalizationManager localization,
++        IBackupService backupService,
++        IConfigurationManager configurationManager)
++    {
++        _logger = logger;
++        _localization = localization;
++        _backupService = backupService;
++        _configurationManager = configurationManager;
++    }
++
++    /// <inheritdoc />
++    public string Name => _localization.GetLocalizedString("TaskBackup");
++
++    /// <inheritdoc />
++    public string Description => _localization.GetLocalizedString("TaskBackupDescription");
++
++    /// <inheritdoc />
++    public string Category => _localization.GetLocalizedString("TasksMaintenanceCategory");
++
++    /// <inheritdoc />
++    public string Key => "ScheduledBackup";
++
++    /// <inheritdoc />
++    public bool IsHidden => false;
++
++    /// <inheritdoc />
++    public bool IsEnabled => true;
++
++    /// <inheritdoc />
++    public bool IsLogged => true;
++
++    /// <inheritdoc />
++    public IEnumerable<TaskTriggerInfo> GetDefaultTriggers()
++    {
++        yield return new TaskTriggerInfo
++        {
++            Type = TaskTriggerInfoType.DailyTrigger,
++            TimeOfDayTicks = TimeSpan.FromHours(3).Ticks
++        };
++    }
++
++    /// <inheritdoc />
++    public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
++    {
++        var options = _configurationManager.GetConfiguration<ScheduledBackupOptions>("scheduledbackup");
++
++        var manifest = await _backupService.CreateBackupAsync(new BackupOptionsDto
++        {
++            Database = options.Database,
++            Metadata = options.Metadata,
++            Trickplay = options.Trickplay,
++            Subtitles = options.Subtitles
++        }).ConfigureAwait(false);
++
++        _logger.LogInformation("Scheduled backup created at {Path}", manifest.Path);
++        progress.Report(70);
++
++        if (options.RetentionCount > 0)
++        {
++            var backups = await _backupService.EnumerateBackups().ConfigureAwait(false);
++            var expired = backups
++                .OrderByDescending(b => b.DateCreated)
++                .Skip(options.RetentionCount);
++
++            foreach (var backup in expired)
++            {
++                cancellationToken.ThrowIfCancellationRequested();
++
++                try
++                {
++                    File.Delete(backup.Path);
++                    _logger.LogInformation("Deleted expired backup {Path} from {Date}", backup.Path, backup.DateCreated);
++                }
++                catch (Exception ex)
++                {
++                    _logger.LogError(ex, "Failed to delete expired backup {Path}", backup.Path);
++                }
++            }
++        }
++
++        progress.Report(100);
++    }
++}
+diff --git a/MediaBrowser.Model/Configuration/ScheduledBackupOptions.cs b/MediaBrowser.Model/Configuration/ScheduledBackupOptions.cs
+new file mode 100644
+index 0000000..7505adf
+--- /dev/null
++++ b/MediaBrowser.Model/Configuration/ScheduledBackupOptions.cs
+@@ -0,0 +1,35 @@
++namespace MediaBrowser.Model.Configuration
++{
++    /// <summary>
++    /// Options controlling the scheduled backup task.
++    /// </summary>
++    public class ScheduledBackupOptions
++    {
++        /// <summary>
++        /// Gets or sets the number of backups to keep in the backup folder.
++        /// When the scheduled backup task runs, the oldest backups beyond this
++        /// count are deleted. Zero or a negative value keeps all backups.
++        /// </summary>
++        public int RetentionCount { get; set; } = 3;
++
++        /// <summary>
++        /// Gets or sets a value indicating whether the database is included in scheduled backups.
++        /// </summary>
++        public bool Database { get; set; } = true;
++
++        /// <summary>
++        /// Gets or sets a value indicating whether metadata is included in scheduled backups.
++        /// </summary>
++        public bool Metadata { get; set; }
++
++        /// <summary>
++        /// Gets or sets a value indicating whether trickplay images are included in scheduled backups.
++        /// </summary>
++        public bool Trickplay { get; set; }
++
++        /// <summary>
++        /// Gets or sets a value indicating whether subtitles are included in scheduled backups.
++        /// </summary>
++        public bool Subtitles { get; set; }
++    }
++}
+-- 
+2.53.0
+

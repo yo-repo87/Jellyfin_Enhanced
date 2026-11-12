@@ -1,0 +1,44 @@
+From c750089feb3ccd0108ff5963fe13a9b7a4058b56 Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <mgibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 16:54:15 +0000
+Subject: [PATCH] Build against the local emby-port server tree
+
+Replace Jellyfin NuGet package references with project references so the
+plugin ABI always matches our fork.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../Jellyfin.Plugin.Tvdb.csproj                 | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/Jellyfin.Plugin.Tvdb/Jellyfin.Plugin.Tvdb.csproj b/Jellyfin.Plugin.Tvdb/Jellyfin.Plugin.Tvdb.csproj
+index 7cfd213..a62b510 100644
+--- a/Jellyfin.Plugin.Tvdb/Jellyfin.Plugin.Tvdb.csproj
++++ b/Jellyfin.Plugin.Tvdb/Jellyfin.Plugin.Tvdb.csproj
+@@ -16,10 +16,19 @@
+   </ItemGroup>
+ 
+   <ItemGroup>
+-    <PackageReference Include="Jellyfin.Data" Version="12.*-*" />
+-    <PackageReference Include="Jellyfin.Controller" Version="12.*-*" />
+-    <PackageReference Include="Jellyfin.Common" Version="12.*-*" />
+-    <PackageReference Include="Jellyfin.Model" Version="12.*-*" />
++    <!-- Built against the local emby-port server tree so the ABI always matches our fork -->
++    <ProjectReference Include="../../jellyfin/Jellyfin.Data/Jellyfin.Data.csproj">
++      <Private>false</Private>
++    </ProjectReference>
++    <ProjectReference Include="../../jellyfin/MediaBrowser.Controller/MediaBrowser.Controller.csproj">
++      <Private>false</Private>
++    </ProjectReference>
++    <ProjectReference Include="../../jellyfin/MediaBrowser.Common/MediaBrowser.Common.csproj">
++      <Private>false</Private>
++    </ProjectReference>
++    <ProjectReference Include="../../jellyfin/MediaBrowser.Model/MediaBrowser.Model.csproj">
++      <Private>false</Private>
++    </ProjectReference>
+     <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.0" />
+     <PackageReference Include="Tvdb.Sdk" Version="4.7.10" />
+   </ItemGroup>
+-- 
+2.53.0
+

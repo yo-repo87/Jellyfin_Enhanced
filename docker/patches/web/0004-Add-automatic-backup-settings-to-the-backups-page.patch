@@ -1,0 +1,207 @@
+From 53941eae8be32e601557d5a0d2a59a25e775f2f1 Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <mgibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 17:08:38 +0000
+Subject: [PATCH 4/5] Add automatic backup settings to the backups page
+
+New 'Automatic Backups' section on the dashboard backups page for the
+scheduled backup task: retention count and backup content, saved to the
+scheduledbackup configuration store.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../components/ScheduledBackupSettings.tsx    | 138 ++++++++++++++++++
+ src/apps/dashboard/routes/backups/index.tsx   |   3 +
+ src/strings/en-us.json                        |   4 +
+ 3 files changed, 145 insertions(+)
+ create mode 100644 src/apps/dashboard/features/backups/components/ScheduledBackupSettings.tsx
+
+diff --git a/src/apps/dashboard/features/backups/components/ScheduledBackupSettings.tsx b/src/apps/dashboard/features/backups/components/ScheduledBackupSettings.tsx
+new file mode 100644
+index 0000000..3f12ba0
+--- /dev/null
++++ b/src/apps/dashboard/features/backups/components/ScheduledBackupSettings.tsx
+@@ -0,0 +1,138 @@
++import { getSystemApi } from '@jellyfin/sdk/lib/utils/api/system-api';
++import Button from '@mui/material/Button';
++import Checkbox from '@mui/material/Checkbox';
++import FormControlLabel from '@mui/material/FormControlLabel';
++import FormGroup from '@mui/material/FormGroup';
++import Stack from '@mui/material/Stack';
++import TextField from '@mui/material/TextField';
++import Typography from '@mui/material/Typography';
++import Loading from 'components/loading/LoadingComponent';
++import SimpleAlert from 'components/SimpleAlert';
++import { useApi } from 'hooks/useApi';
++import { QUERY_KEY, useNamedConfiguration } from 'hooks/useNamedConfiguration';
++import globalize from 'lib/globalize';
++import React, { useCallback, useEffect, useState } from 'react';
++import { queryClient } from 'utils/query/queryClient';
++
++const CONFIG_KEY = 'scheduledbackup';
++
++interface ScheduledBackupOptions {
++    RetentionCount: number;
++    Database: boolean;
++    Metadata: boolean;
++    Trickplay: boolean;
++    Subtitles: boolean;
++}
++
++const ScheduledBackupSettings = () => {
++    const { api } = useApi();
++    const { data: config, isPending, isError } = useNamedConfiguration<ScheduledBackupOptions>(CONFIG_KEY);
++    const [ options, setOptions ] = useState<ScheduledBackupOptions | null>(null);
++    const [ isSaved, setIsSaved ] = useState(false);
++    const [ isSaveError, setIsSaveError ] = useState(false);
++
++    useEffect(() => {
++        if (config && options === null) {
++            setOptions(config);
++        }
++    }, [ config, options ]);
++
++    const onRetentionChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
++        const value = parseInt(e.target.value, 10);
++        setOptions(prev => prev && { ...prev, RetentionCount: Number.isNaN(value) ? 0 : value });
++    }, []);
++
++    const onOptionChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
++        const { name, checked } = e.target;
++        setOptions(prev => prev && { ...prev, [name]: checked });
++    }, []);
++
++    const onSavedAlertClose = useCallback(() => {
++        setIsSaved(false);
++    }, []);
++
++    const onErrorAlertClose = useCallback(() => {
++        setIsSaveError(false);
++    }, []);
++
++    const onSave = useCallback(() => {
++        if (!api || !options) return;
++
++        getSystemApi(api)
++            .updateNamedConfiguration({ key: CONFIG_KEY, body: options })
++            .then(() => {
++                setIsSaved(true);
++                void queryClient.invalidateQueries({ queryKey: [ QUERY_KEY, CONFIG_KEY ] });
++            })
++            .catch(err => {
++                console.error('[ScheduledBackupSettings] failed to save configuration', err);
++                setIsSaveError(true);
++            });
++    }, [ api, options ]);
++
++    if (isError) {
++        // The settings card is an extra on this page; don't break the page over it
++        return null;
++    }
++
++    if (isPending || !options) {
++        return <Loading />;
++    }
++
++    return (
++        <Stack spacing={2}>
++            <SimpleAlert
++                open={isSaved}
++                title={globalize.translate('Success')}
++                text={globalize.translate('SettingsSaved')}
++                onClose={onSavedAlertClose}
++            />
++            <SimpleAlert
++                open={isSaveError}
++                text={globalize.translate('UnknownError')}
++                onClose={onErrorAlertClose}
++            />
++            <Typography variant='h2'>
++                {globalize.translate('HeaderAutomaticBackups')}
++            </Typography>
++            <Typography>
++                {globalize.translate('AutomaticBackupsHelp')}
++            </Typography>
++            <TextField
++                type='number'
++                label={globalize.translate('LabelBackupRetentionCount')}
++                helperText={globalize.translate('LabelBackupRetentionCountHelp')}
++                value={options.RetentionCount}
++                onChange={onRetentionChange}
++                slotProps={{ htmlInput: { min: 0, step: 1 } }}
++            />
++            <FormGroup>
++                <FormControlLabel
++                    control={<Checkbox name='Database' checked={options.Database} onChange={onOptionChange} />}
++                    label={globalize.translate('LabelDatabase')}
++                />
++                <FormControlLabel
++                    control={<Checkbox name='Metadata' checked={options.Metadata} onChange={onOptionChange} />}
++                    label={globalize.translate('LabelMetadata')}
++                />
++                <FormControlLabel
++                    control={<Checkbox name='Subtitles' checked={options.Subtitles} onChange={onOptionChange} />}
++                    label={globalize.translate('Subtitles')}
++                />
++                <FormControlLabel
++                    control={<Checkbox name='Trickplay' checked={options.Trickplay} onChange={onOptionChange} />}
++                    label={globalize.translate('Trickplay')}
++                />
++            </FormGroup>
++            <Button
++                variant='contained'
++                onClick={onSave}
++                sx={{ alignSelf: 'flex-start' }}
++            >
++                {globalize.translate('Save')}
++            </Button>
++        </Stack>
++    );
++};
++
++export default ScheduledBackupSettings;
+diff --git a/src/apps/dashboard/routes/backups/index.tsx b/src/apps/dashboard/routes/backups/index.tsx
+index aad95db..62b2ee9 100644
+--- a/src/apps/dashboard/routes/backups/index.tsx
++++ b/src/apps/dashboard/routes/backups/index.tsx
+@@ -20,6 +20,7 @@ import SimpleAlert from 'components/SimpleAlert';
+ import RestoreConfirmationDialog from 'apps/dashboard/features/backups/components/RestoreConfirmationDialog';
+ import { useRestoreBackup } from 'apps/dashboard/features/backups/api/useRestoreBackup';
+ import RestoreProgressDialog from 'apps/dashboard/features/backups/components/RestoreProgressDialog';
++import ScheduledBackupSettings from 'apps/dashboard/features/backups/components/ScheduledBackupSettings';
+ import { useApi } from 'hooks/useApi';
+ import { getSystemApi } from '@jellyfin/sdk/lib/utils/api/system-api';
+ import useLiveTasks from 'apps/dashboard/features/tasks/hooks/useLiveTasks';
+@@ -222,6 +223,8 @@ export const Component = () => {
+                                 </List>
+                             )}
+                         </Box>
++
++                        <ScheduledBackupSettings />
+                     </Stack>
+                 )}
+             </Box>
+diff --git a/src/strings/en-us.json b/src/strings/en-us.json
+index 563d647..ebae502 100755
+--- a/src/strings/en-us.json
++++ b/src/strings/en-us.json
+@@ -421,6 +421,8 @@
+     "HeaderAudioBooks": "Audiobooks",
+     "HeaderAudioAdvanced": "Audio Advanced",
+     "HeaderAudioSettings": "Audio Settings",
++    "AutomaticBackupsHelp": "A scheduled task creates backups with the content selected below and prunes old ones. The schedule can be changed under Scheduled Tasks (daily at 3:00 by default).",
++    "HeaderAutomaticBackups": "Automatic Backups",
+     "HeaderAutoDiscovery": "Network Discovery",
+     "HeaderBlockItemsWithNoRating": "Block items with no or unrecognized rating information",
+     "HeaderBackupsHelp": "Create and restore snapshots of your server which can include the database, metadata, subtitles and trickplay.",
+@@ -666,6 +668,8 @@
+     "LabelAutomaticDiscovery": "Enable Auto Discovery",
+     "LabelAutomaticDiscoveryHelp": "Allow applications to automatically detect Jellyfin by using UDP port 7359.",
+     "LabelAvailable": "Available",
++    "LabelBackupRetentionCount": "Number of backups to keep",
++    "LabelBackupRetentionCountHelp": "When the scheduled backup task runs, the oldest backups beyond this count are deleted. Use 0 to keep all backups.",
+     "LabelBackupsUnavailable": "No backups available",
+     "LabelBackupWarning": "There are ongoing scheduled tasks. It's recommended to stop them or wait for them to complete before running the backup operation.",
+     "LabelBaseUrl": "Base URL",
+-- 
+2.53.0
+

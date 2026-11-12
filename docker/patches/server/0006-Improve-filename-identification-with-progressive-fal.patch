@@ -1,0 +1,190 @@
+From 928500576f68b0547a2719734ce0f8cb0042e3dc Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <mgibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 21:32:19 +0000
+Subject: [PATCH 6/7] Improve filename identification with progressive fallback
+ searches
+
+Add GetSearchAttempts method to TmdbUtils that generates progressively less
+specific search attempts: full name+year, name without year, then
+progressively shorter names (dropping trailing words) that often contain
+release tags. This helps when filenames have non-standard tags that survive
+initial cleaning.
+
+Applied to both movie and series TMDb providers (GetSearchResults and
+GetMetadata) so failed searches automatically retry with simplified names
+before giving up. Also expanded CleanStrings regex with modern release tags
+(av1, hevc, remux, 10bit, hdr10, atmos, criterion, dsnp, etc.) to improve
+automatic noise removal during filename parsing.
+
+Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>
+---
+ Emby.Naming/Common/NamingOptions.cs           |  2 +-
+ .../Plugins/Tmdb/Movies/TmdbMovieProvider.cs  | 23 +++++++++---
+ .../Plugins/Tmdb/TV/TmdbSeriesProvider.cs     | 24 +++++++++++--
+ .../Plugins/Tmdb/TmdbUtils.cs                 | 36 +++++++++++++++++++
+ .../Video/CleanStringTests.cs                 |  6 ++++
+ 5 files changed, 83 insertions(+), 8 deletions(-)
+
+diff --git a/Emby.Naming/Common/NamingOptions.cs b/Emby.Naming/Common/NamingOptions.cs
+index 58d6e01..25bdc36 100644
+--- a/Emby.Naming/Common/NamingOptions.cs
++++ b/Emby.Naming/Common/NamingOptions.cs
+@@ -151,7 +151,7 @@ namespace Emby.Naming.Common
+ 
+             CleanStrings =
+             [
+-                @"^\s*(?<cleaned>.+?)[ _\,\.\(\)\[\]\-](3d|sbs|tab|hsbs|htab|mvc|HDR|HDC|UHD|UltraHD|4k|ac3|dts|custom|dc|divx|divx5|dsr|dsrip|dutch|dvd|dvdrip|dvdscr|dvdscreener|screener|dvdivx|cam|fragment|fs|hdtv|hdrip|hdtvrip|internal|limited|multi|subs|ntsc|ogg|ogm|pal|pdtv|proper|repack|rerip|retail|cd[1-9]|r5|bd5|bd|se|svcd|swedish|german|read.nfo|nfofix|unrated|ws|web-dl|telesync|ts|telecine|tc|brrip|bdrip|480p|480i|576p|576i|720p|720i|1080p|1080i|2160p|hrhd|hrhdtv|hddvd|bluray|blu-ray|x264|x265|h264|h265|xvid|xvidvd|xxx|www.www|AAC|DTS)(?=[ _\,\.\(\)\[\]\-]|$)",
++                @"^\s*(?<cleaned>.+?)[ _\,\.\(\)\[\]\-](3d|sbs|tab|hsbs|htab|mvc|HDR|HDC|UHD|UltraHD|4k|ac3|dts|custom|dc|divx|divx5|dsr|dsrip|dutch|dvd|dvdrip|dvdscr|dvdscreener|screener|dvdivx|cam|fragment|fs|hdtv|hdrip|hdtvrip|internal|limited|multi|subs|ntsc|ogg|ogm|pal|pdtv|proper|repack|rerip|retail|cd[1-9]|r5|bd5|bd|se|svcd|swedish|german|read.nfo|nfofix|unrated|ws|web-dl|webrip|web-rip|webdl|remux|telesync|ts|telecine|tc|brrip|bdrip|480p|480i|576p|576i|720p|720i|1080p|1080i|2160p|hrhd|hrhdtv|hddvd|bluray|blu-ray|x264|x265|h264|h265|hevc|av1|vp9|8bit|10bit|12bit|hdr10|hdr10plus|dovi|dolbyvision|atmos|truehd|eac3|ddp|ddp[0-9]|dd[0-9]|flac|opus|imax|hybrid|extended|remastered|restored|uncut|uncensored|theatrical|criterion|amzn|dsnp|hmax|atvp|xvid|xvidvd|xxx|www.www|AAC|DTS)(?=[ _\,\.\(\)\[\]\-]|$)",
+                 @"^\s*(?<cleaned>.+?)((\s*\[[^\]]+\]\s*)+)(\.[^\s]+)?$",
+                 @"^\s*(?<cleaned>.+?)\WE[0-9]+(-|~)E?[0-9]+(\W|$)",
+                 @"^\s*\[[^\]]+\](?!\.\w+$)\s*(?<cleaned>.+)",
+diff --git a/MediaBrowser.Providers/Plugins/Tmdb/Movies/TmdbMovieProvider.cs b/MediaBrowser.Providers/Plugins/Tmdb/Movies/TmdbMovieProvider.cs
+index 9501da7..918ac73 100644
+--- a/MediaBrowser.Providers/Plugins/Tmdb/Movies/TmdbMovieProvider.cs
++++ b/MediaBrowser.Providers/Plugins/Tmdb/Movies/TmdbMovieProvider.cs
+@@ -114,9 +114,16 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.Movies
+ 
+             if (movieResults is null)
+             {
+-                movieResults = await _tmdbClientManager
+-                    .SearchMovieAsync(searchInfo.Name, searchInfo.Year ?? 0, searchInfo.MetadataLanguage, searchInfo.MetadataCountryCode, cancellationToken)
+-                    .ConfigureAwait(false);
++                foreach (var (attemptName, attemptYear) in TmdbUtils.GetSearchAttempts(TmdbUtils.CleanName(searchInfo.Name), searchInfo.Year ?? 0))
++                {
++                    movieResults = await _tmdbClientManager
++                        .SearchMovieAsync(attemptName, attemptYear, searchInfo.MetadataLanguage, searchInfo.MetadataCountryCode, cancellationToken)
++                        .ConfigureAwait(false);
++                    if (movieResults is not null && movieResults.Count > 0)
++                    {
++                        break;
++                    }
++                }
+             }
+ 
+             if (movieResults is null)
+@@ -165,7 +172,15 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.Movies
+                 var cleanedName = TmdbUtils.CleanName(parsedName.Name);
+                 var searchYear = info.Year ?? parsedName.Year ?? 0;
+ 
+-                var searchResults = await _tmdbClientManager.SearchMovieAsync(cleanedName, searchYear, info.MetadataLanguage, info.MetadataCountryCode, cancellationToken).ConfigureAwait(false);
++                IReadOnlyList<SearchMovie>? searchResults = null;
++                foreach (var (attemptName, attemptYear) in TmdbUtils.GetSearchAttempts(cleanedName, searchYear))
++                {
++                    searchResults = await _tmdbClientManager.SearchMovieAsync(attemptName, attemptYear, info.MetadataLanguage, info.MetadataCountryCode, cancellationToken).ConfigureAwait(false);
++                    if (searchResults is not null && searchResults.Count > 0)
++                    {
++                        break;
++                    }
++                }
+ 
+                 var match = TmdbUtils.FindBestMatch(searchResults, parsedName.Name, searchYear);
+ 
+diff --git a/MediaBrowser.Providers/Plugins/Tmdb/TV/TmdbSeriesProvider.cs b/MediaBrowser.Providers/Plugins/Tmdb/TV/TmdbSeriesProvider.cs
+index 155548e..e1e038d 100755
+--- a/MediaBrowser.Providers/Plugins/Tmdb/TV/TmdbSeriesProvider.cs
++++ b/MediaBrowser.Providers/Plugins/Tmdb/TV/TmdbSeriesProvider.cs
+@@ -110,8 +110,17 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
+                 }
+             }
+ 
+-            var tvSearchResults = await _tmdbClientManager.SearchSeriesAsync(searchInfo.Name, searchInfo.MetadataLanguage, searchInfo.MetadataCountryCode, cancellationToken: cancellationToken)
+-                .ConfigureAwait(false);
++            IReadOnlyList<SearchTv>? tvSearchResults = null;
++            foreach (var (attemptName, attemptYear) in TmdbUtils.GetSearchAttempts(TmdbUtils.CleanName(searchInfo.Name), searchInfo.Year ?? 0))
++            {
++                tvSearchResults = await _tmdbClientManager.SearchSeriesAsync(attemptName, searchInfo.MetadataLanguage, searchInfo.MetadataCountryCode, attemptYear, cancellationToken)
++                    .ConfigureAwait(false);
++                if (tvSearchResults is not null && tvSearchResults.Count > 0)
++                {
++                    break;
++                }
++            }
++
+             if (tvSearchResults is null)
+             {
+                 return [];
+@@ -205,7 +214,16 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
+                 var parsedName = _libraryManager.ParseName(info.Name);
+                 var cleanedName = TmdbUtils.CleanName(parsedName.Name);
+                 var searchYear = info.Year ?? parsedName.Year ?? 0;
+-                var searchResults = await _tmdbClientManager.SearchSeriesAsync(cleanedName, info.MetadataLanguage, info.MetadataCountryCode, searchYear, cancellationToken).ConfigureAwait(false);
++
++                IReadOnlyList<SearchTv>? searchResults = null;
++                foreach (var (attemptName, attemptYear) in TmdbUtils.GetSearchAttempts(cleanedName, searchYear))
++                {
++                    searchResults = await _tmdbClientManager.SearchSeriesAsync(attemptName, info.MetadataLanguage, info.MetadataCountryCode, attemptYear, cancellationToken).ConfigureAwait(false);
++                    if (searchResults is not null && searchResults.Count > 0)
++                    {
++                        break;
++                    }
++                }
+ 
+                 var match = TmdbUtils.FindBestMatch(searchResults, parsedName.Name, searchYear);
+ 
+diff --git a/MediaBrowser.Providers/Plugins/Tmdb/TmdbUtils.cs b/MediaBrowser.Providers/Plugins/Tmdb/TmdbUtils.cs
+index 4ef8c53..5471446 100644
+--- a/MediaBrowser.Providers/Plugins/Tmdb/TmdbUtils.cs
++++ b/MediaBrowser.Providers/Plugins/Tmdb/TmdbUtils.cs
+@@ -126,6 +126,42 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
+             return NonSearchTermRegex().Replace(name, " ").Trim();
+         }
+ 
++        /// <summary>
++        /// Generates the name and year combinations to try for a text search, from most to
++        /// least specific. The first attempt is the name and year as given. When a search
++        /// returns nothing, later attempts drop the year (it may simply be wrong) and then
++        /// progressively drop trailing words, because release tags that survive filename
++        /// cleaning end up as extra words at the end of the parsed name.
++        /// </summary>
++        /// <param name="cleanedName">The search name, already cleaned with <see cref="CleanName"/>.</param>
++        /// <param name="year">The year to search with, or 0 when unknown.</param>
++        /// <returns>The (name, year) attempts, most specific first.</returns>
++        public static IEnumerable<(string Name, int Year)> GetSearchAttempts(string cleanedName, int year)
++        {
++            yield return (cleanedName, year);
++            if (year > 0)
++            {
++                yield return (cleanedName, 0);
++            }
++
++            var current = cleanedName;
++            for (var i = 0; i < 3; i++)
++            {
++                var cut = current.LastIndexOf(' ');
++                if (cut < 3)
++                {
++                    break;
++                }
++
++                current = current[..cut].TrimEnd();
++                yield return (current, year);
++                if (year > 0)
++                {
++                    yield return (current, 0);
++                }
++            }
++        }
++
+         /// <summary>
+         /// Reduces a title to the form used to compare a local name against a TMDb search result.
+         /// </summary>
+diff --git a/tests/Jellyfin.Naming.Tests/Video/CleanStringTests.cs b/tests/Jellyfin.Naming.Tests/Video/CleanStringTests.cs
+index 8b4a6ff..e1017aa 100644
+--- a/tests/Jellyfin.Naming.Tests/Video/CleanStringTests.cs
++++ b/tests/Jellyfin.Naming.Tests/Video/CleanStringTests.cs
+@@ -24,6 +24,12 @@ namespace Jellyfin.Naming.Tests.Video
+         [InlineData("Crouching.Tiger.Hidden.Dragon.BDrip-HDC.mkv", "Crouching.Tiger.Hidden.Dragon")]
+         [InlineData("Crouching.Tiger.Hidden.Dragon.4K.UltraHD.HDR.BDrip-HDC.mkv", "Crouching.Tiger.Hidden.Dragon")]
+         [InlineData("Last.Call.for.Nowhere.WEB-DL.1080p", "Last.Call.for.Nowhere")]
++        [InlineData("Crouching.Tiger.Hidden.Dragon.REMUX.HDR10.HEVC.mkv", "Crouching.Tiger.Hidden.Dragon")]
++        [InlineData("Crouching.Tiger.Hidden.Dragon.WEBRip.AV1.Atmos.mkv", "Crouching.Tiger.Hidden.Dragon")]
++        [InlineData("Crouching.Tiger.Hidden.Dragon.AMZN.WEB-DL.DDP5.1.mkv", "Crouching.Tiger.Hidden.Dragon")]
++        [InlineData("Crouching.Tiger.Hidden.Dragon.EXTENDED.2160p.DoVi.mkv", "Crouching.Tiger.Hidden.Dragon")]
++        [InlineData("Crouching.Tiger.Hidden.Dragon.REMASTERED.IMAX.10bit.mkv", "Crouching.Tiger.Hidden.Dragon")]
++        [InlineData("Uncut Gems 1080p.mkv", "Uncut Gems")]
+         [InlineData("[HorribleSubs] Made in Abyss - 13 [720p].mkv", "Made in Abyss")]
+         [InlineData("[Tsundere] Kore wa Zombie Desu ka of the Dead [BDRip h264 1920x1080 FLAC]", "Kore wa Zombie Desu ka of the Dead")]
+         [InlineData("[Erai-raws] Jujutsu Kaisen - 03 [720p][Multiple Subtitle].mkv", "Jujutsu Kaisen")]
+-- 
+2.53.0
+

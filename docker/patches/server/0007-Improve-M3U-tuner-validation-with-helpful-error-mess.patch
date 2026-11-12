@@ -1,0 +1,87 @@
+From b3246a5e07c8517e8997d6f1176b1847eb7ad46d Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <mgibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 22:14:03 +0000
+Subject: [PATCH 7/7] Improve M3U tuner validation with helpful error messages
+
+Enhanced the M3U tuner validation to check that the source file/URL is
+valid M3U format (starts with #EXTM3U marker) and provide specific,
+actionable error messages for common failure scenarios:
+- 404/Client errors: URL is wrong or source moved
+- 5xx errors: Server is temporarily unavailable
+- File not found: Invalid file path
+- Access denied: Permission issues
+- Invalid format: Not actually a valid M3U file
+
+This helps users quickly diagnose and fix issues when adding M3U playlists,
+improving the Live TV setup experience.
+
+Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>
+---
+ .../TunerHosts/M3UTunerHost.cs                | 50 ++++++++++++++++++-
+ 1 file changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/src/Jellyfin.LiveTv/TunerHosts/M3UTunerHost.cs b/src/Jellyfin.LiveTv/TunerHosts/M3UTunerHost.cs
+index 902ca76..357f7a3 100644
+--- a/src/Jellyfin.LiveTv/TunerHosts/M3UTunerHost.cs
++++ b/src/Jellyfin.LiveTv/TunerHosts/M3UTunerHost.cs
+@@ -132,8 +132,56 @@ namespace Jellyfin.LiveTv.TunerHosts
+ 
+         public async Task Validate(TunerHostInfo info)
+         {
+-            using (await new M3uParser(Logger, _httpClientFactory).GetListingsStream(info, CancellationToken.None).ConfigureAwait(false))
++            try
+             {
++                using var reader = new StreamReader(await new M3uParser(Logger, _httpClientFactory).GetListingsStream(info, CancellationToken.None).ConfigureAwait(false));
++                var firstLine = await reader.ReadLineAsync().ConfigureAwait(false);
++                if (string.IsNullOrWhiteSpace(firstLine) || !firstLine.Trim().StartsWith("#EXTM3U", StringComparison.OrdinalIgnoreCase))
++                {
++                    throw new ArgumentException("Invalid M3U file: does not start with #EXTM3U marker. Please verify the URL points to a valid M3U playlist file.");
++                }
++            }
++            catch (HttpRequestException ex)
++            {
++                var message = "Cannot access the M3U URL";
++                if (ex.StatusCode == HttpStatusCode.NotFound)
++                {
++                    message = "The M3U URL returned a 404 Not Found error. Please verify the URL is correct.";
++                }
++                else if (ex.StatusCode == HttpStatusCode.Unauthorized || ex.StatusCode == HttpStatusCode.Forbidden)
++                {
++                    message = "The M3U URL requires authentication or is forbidden. Please verify credentials and URL access.";
++                }
++                else if ((int?)ex.StatusCode >= 400 && (int?)ex.StatusCode < 500)
++                {
++                    message = $"The M3U URL returned a client error ({ex.StatusCode}). Please verify the URL and try again.";
++                }
++                else if ((int?)ex.StatusCode >= 500)
++                {
++                    message = "The M3U server returned an error (5xx). The server may be temporarily unavailable.";
++                }
++                else
++                {
++                    message = "Cannot reach the M3U URL. Please verify the URL is correct and the server is reachable.";
++                }
++
++                throw new ArgumentException(message, ex);
++            }
++            catch (FileNotFoundException)
++            {
++                throw new ArgumentException("The M3U file path does not exist. Please verify the file path is correct.", new FileNotFoundException());
++            }
++            catch (UnauthorizedAccessException)
++            {
++                throw new ArgumentException("Access denied to the M3U file. Please verify file permissions.", new UnauthorizedAccessException());
++            }
++            catch (ArgumentException)
++            {
++                throw;
++            }
++            catch (Exception ex)
++            {
++                throw new ArgumentException($"Failed to validate M3U source: {ex.Message}", ex);
+             }
+         }
+ 
+-- 
+2.53.0
+

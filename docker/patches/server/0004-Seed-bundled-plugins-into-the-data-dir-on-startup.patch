@@ -1,0 +1,97 @@
+From b9433f2fe07f91a37906b429e1b70a2327e80461 Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <mgibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 16:54:15 +0000
+Subject: [PATCH 4/7] Seed bundled plugins into the data dir on startup
+
+Plugins staged in a 'plugins' folder next to the server binary are copied
+into the data plugins directory before the PluginManager starts, so they
+ship preinstalled (the way Emby bundles Tvdb.dll in system/plugins). A
+marker file per bundled folder keeps an uninstall from being re-seeded.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ Jellyfin.Server/Helpers/StartupHelpers.cs | 54 +++++++++++++++++++++++
+ Jellyfin.Server/Program.cs                |  2 +
+ 2 files changed, 56 insertions(+)
+
+diff --git a/Jellyfin.Server/Helpers/StartupHelpers.cs b/Jellyfin.Server/Helpers/StartupHelpers.cs
+index 93c9961..1050c67 100644
+--- a/Jellyfin.Server/Helpers/StartupHelpers.cs
++++ b/Jellyfin.Server/Helpers/StartupHelpers.cs
+@@ -27,6 +27,60 @@ public static class StartupHelpers
+ {
+     private static readonly string[] _relevantEnvVarPrefixes = { "JELLYFIN_", "DOTNET_", "ASPNETCORE_" };
+ 
++    /// <summary>
++    /// Copies plugins bundled with the server (folders inside the "plugins" directory
++    /// next to the server binary) into the data plugins directory, so they are
++    /// preinstalled without a trip to the plugin catalog. Each bundled folder is only
++    /// seeded once, tracked by a marker file, so uninstalling a seeded plugin sticks.
++    /// </summary>
++    /// <param name="appPaths">The application paths to use.</param>
++    /// <param name="logger">The logger to use.</param>
++    public static void SeedBundledPlugins(IApplicationPaths appPaths, ILogger logger)
++    {
++        var bundledRoot = Path.Combine(AppContext.BaseDirectory, "plugins");
++        if (!Directory.Exists(bundledRoot))
++        {
++            return;
++        }
++
++        Directory.CreateDirectory(appPaths.PluginsPath);
++        foreach (var sourceDir in Directory.EnumerateDirectories(bundledRoot))
++        {
++            var folderName = Path.GetFileName(sourceDir);
++            var markerPath = Path.Combine(appPaths.PluginsPath, ".seeded-" + folderName);
++            var targetDir = Path.Combine(appPaths.PluginsPath, folderName);
++            if (File.Exists(markerPath) || Directory.Exists(targetDir))
++            {
++                continue;
++            }
++
++            try
++            {
++                CopyDirectoryRecursive(sourceDir, targetDir);
++                File.WriteAllText(markerPath, string.Empty);
++                logger.LogInformation("Seeded bundled plugin {Name} into {Target}", folderName, targetDir);
++            }
++            catch (Exception ex)
++            {
++                logger.LogError(ex, "Failed to seed bundled plugin {Name}", folderName);
++            }
++        }
++    }
++
++    private static void CopyDirectoryRecursive(string sourceDir, string targetDir)
++    {
++        Directory.CreateDirectory(targetDir);
++        foreach (var file in Directory.EnumerateFiles(sourceDir))
++        {
++            File.Copy(file, Path.Combine(targetDir, Path.GetFileName(file)));
++        }
++
++        foreach (var dir in Directory.EnumerateDirectories(sourceDir))
++        {
++            CopyDirectoryRecursive(dir, Path.Combine(targetDir, Path.GetFileName(dir)));
++        }
++    }
++
+     /// <summary>
+     /// Logs relevant environment variables and information about the host.
+     /// </summary>
+diff --git a/Jellyfin.Server/Program.cs b/Jellyfin.Server/Program.cs
+index 29c7d51..7efa79e 100644
+--- a/Jellyfin.Server/Program.cs
++++ b/Jellyfin.Server/Program.cs
+@@ -139,6 +139,8 @@ namespace Jellyfin.Server
+ 
+             StartupHelpers.PerformStaticInitialization();
+ 
++            StartupHelpers.SeedBundledPlugins(appPaths, _logger);
++
+             SetupServer.ReportActivity(StartupActivity.Initializing);
+             await ApplyStartupMigrationAsync(appPaths, startupConfig, options).ConfigureAwait(false);
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,2121 @@
+From 96f76c22680ed8df768c8dfc5bd7587446ac7898 Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <matthew.gibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 16:15:07 +0000
+Subject: [PATCH 2/7] Add Emby-style easy pin code for in-network sign-in
+
+Reimplements the easy password feature: a per-user numeric pin stored as
+a standard password hash (new EasyPassword column + migration) that is
+accepted as an alternative to the full password only for connections in
+the local network, gated by the user's EnableLocalPassword setting.
+Adds POST /Users/{userId}/EasyPassword to set or clear the pin and
+surfaces HasConfiguredEasyPassword in the user dto again.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ Jellyfin.Api/Controllers/UserController.cs    |   35 +
+ .../Models/UserDtos/UpdateUserEasyPassword.cs |   17 +
+ .../Users/DefaultAuthenticationProvider.cs    |   35 +
+ .../Users/UserManager.cs                      |   33 +
+ .../Library/IUserManager.cs                   |    8 +
+ MediaBrowser.Model/Dto/UserDto.cs             |    1 -
+ .../Entities/User.cs                          |   10 +
+ ...20261111155605_AddEasyPassword.Designer.cs | 1813 +++++++++++++++++
+ .../20261111155605_AddEasyPassword.cs         |   29 +
+ .../Migrations/JellyfinDbModelSnapshot.cs     |  Bin 64659 -> 64808 bytes
+ 10 files changed, 1980 insertions(+), 1 deletion(-)
+ create mode 100644 Jellyfin.Api/Models/UserDtos/UpdateUserEasyPassword.cs
+ create mode 100644 src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/20261111155605_AddEasyPassword.Designer.cs
+ create mode 100644 src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/20261111155605_AddEasyPassword.cs
+
+diff --git a/Jellyfin.Api/Controllers/UserController.cs b/Jellyfin.Api/Controllers/UserController.cs
+index 5b46ae4..dbff417 100644
+--- a/Jellyfin.Api/Controllers/UserController.cs
++++ b/Jellyfin.Api/Controllers/UserController.cs
+@@ -318,6 +318,41 @@ public class UserController : BaseJellyfinApiController
+         return NoContent();
+     }
+ 
++    /// <summary>
++    /// Updates a user's easy pin code used for in-network sign-in.
++    /// </summary>
++    /// <param name="userId">The user id.</param>
++    /// <param name="request">The <see cref="UpdateUserEasyPassword"/> request.</param>
++    /// <response code="204">Pin code updated.</response>
++    /// <response code="403">Pin code update forbidden.</response>
++    /// <response code="404">User not found.</response>
++    /// <returns>A <see cref="NoContentResult"/> indicating success or a <see cref="ForbidResult"/> or <see cref="NotFoundResult"/> on failure.</returns>
++    [HttpPost("{userId}/EasyPassword")]
++    [Authorize]
++    [ProducesResponseType(StatusCodes.Status204NoContent)]
++    [ProducesResponseType(StatusCodes.Status403Forbidden)]
++    [ProducesResponseType(StatusCodes.Status404NotFound)]
++    public async Task<ActionResult> UpdateUserEasyPassword(
++        [FromRoute, Required] Guid userId,
++        [FromBody, Required] UpdateUserEasyPassword request)
++    {
++        var user = _userManager.GetUserById(userId);
++        if (user is null)
++        {
++            return NotFound();
++        }
++
++        if (!RequestHelpers.AssertCanUpdateUser(User, user, true))
++        {
++            return StatusCode(StatusCodes.Status403Forbidden, "User is not allowed to update the pin code.");
++        }
++
++        var newPin = request.ResetPassword ? string.Empty : request.NewPw ?? string.Empty;
++        await _userManager.ChangeEasyPassword(user.Id, newPin).ConfigureAwait(false);
++
++        return NoContent();
++    }
++
+     /// <summary>
+     /// Updates a user's password.
+     /// </summary>
+diff --git a/Jellyfin.Api/Models/UserDtos/UpdateUserEasyPassword.cs b/Jellyfin.Api/Models/UserDtos/UpdateUserEasyPassword.cs
+new file mode 100644
+index 0000000..0aa77ff
+--- /dev/null
++++ b/Jellyfin.Api/Models/UserDtos/UpdateUserEasyPassword.cs
+@@ -0,0 +1,17 @@
++namespace Jellyfin.Api.Models.UserDtos;
++
++/// <summary>
++/// The update user easy password request body.
++/// </summary>
++public class UpdateUserEasyPassword
++{
++    /// <summary>
++    /// Gets or sets the new plain text pin code.
++    /// </summary>
++    public string? NewPw { get; set; }
++
++    /// <summary>
++    /// Gets or sets a value indicating whether to reset the pin code.
++    /// </summary>
++    public bool ResetPassword { get; set; }
++}
+diff --git a/Jellyfin.Server.Implementations/Users/DefaultAuthenticationProvider.cs b/Jellyfin.Server.Implementations/Users/DefaultAuthenticationProvider.cs
+index 446849b..cecef36 100644
+--- a/Jellyfin.Server.Implementations/Users/DefaultAuthenticationProvider.cs
++++ b/Jellyfin.Server.Implementations/Users/DefaultAuthenticationProvider.cs
+@@ -107,5 +107,40 @@ namespace Jellyfin.Server.Implementations.Users
+ 
+             return Task.CompletedTask;
+         }
++
++        /// <summary>
++        /// Changes the user's easy pin code used for in-network sign-in, clearing it when empty.
++        /// </summary>
++        /// <param name="user">The user.</param>
++        /// <param name="newPassword">The new pin code, or empty to clear it.</param>
++        /// <returns>A task representing the operation.</returns>
++        public Task ChangeEasyPassword(User user, string newPassword)
++        {
++            if (string.IsNullOrEmpty(newPassword))
++            {
++                user.EasyPassword = null;
++                return Task.CompletedTask;
++            }
++
++            user.EasyPassword = _cryptographyProvider.CreatePasswordHash(newPassword).ToString();
++
++            return Task.CompletedTask;
++        }
++
++        /// <summary>
++        /// Verifies a value against the user's easy pin code.
++        /// </summary>
++        /// <param name="user">The user.</param>
++        /// <param name="password">The value to verify.</param>
++        /// <returns><c>true</c> if the value matches the user's pin code.</returns>
++        public bool VerifyEasyPassword(User user, string password)
++        {
++            if (string.IsNullOrEmpty(user.EasyPassword) || string.IsNullOrEmpty(password))
++            {
++                return false;
++            }
++
++            return _cryptographyProvider.Verify(PasswordHash.Parse(user.EasyPassword), password);
++        }
+     }
+ }
+diff --git a/Jellyfin.Server.Implementations/Users/UserManager.cs b/Jellyfin.Server.Implementations/Users/UserManager.cs
+index b15f6b9..135ed4f 100644
+--- a/Jellyfin.Server.Implementations/Users/UserManager.cs
++++ b/Jellyfin.Server.Implementations/Users/UserManager.cs
+@@ -448,6 +448,26 @@ namespace Jellyfin.Server.Implementations.Users
+             await _eventManager.PublishAsync(new UserPasswordChangedEventArgs(dbUser)).ConfigureAwait(false);
+         }
+ 
++        /// <inheritdoc/>
++        public async Task ChangeEasyPassword(Guid userId, string newPassword)
++        {
++            using (await _userLock.LockAsync(userId).ConfigureAwait(false))
++            {
++                var dbContext = await _dbProvider.CreateDbContextAsync().ConfigureAwait(false);
++                await using (dbContext.ConfigureAwait(false))
++                {
++                    var dbUser = await UserQuery(dbContext)
++                        .AsTracking()
++                        .FirstOrDefaultAsync(u => u.Id == userId)
++                        .ConfigureAwait(false)
++                        ?? throw new ResourceNotFoundException(nameof(userId));
++
++                    await _defaultAuthenticationProvider.ChangeEasyPassword(dbUser, newPassword).ConfigureAwait(false);
++                    await dbContext.SaveChangesAsync().ConfigureAwait(false);
++                }
++            }
++        }
++
+         /// <inheritdoc/>
+         public UserDto GetUserDto(User user, string? remoteEndPoint = null)
+         {
+@@ -461,6 +481,7 @@ namespace Jellyfin.Server.Implementations.Users
+                 LastLoginDate = user.LastLoginDate,
+                 LastActivityDate = user.LastActivityDate,
+                 PrimaryImageTag = user.ProfileImage is not null ? _imageProcessor.GetImageCacheTag(user) : null,
++                HasConfiguredEasyPassword = !string.IsNullOrEmpty(user.EasyPassword),
+                 Configuration = new UserConfiguration
+                 {
+                     SubtitleMode = user.SubtitleMode,
+@@ -564,6 +585,18 @@ namespace Jellyfin.Server.Implementations.Users
+                 var authenticationProvider = authResult.AuthenticationProvider;
+                 success = authResult.Success;
+ 
++                // Easy pin code: allow in-network sign-in with the user's pin as an
++                // alternative to the full password. The pin is never accepted remotely.
++                if (!success
++                    && user is not null
++                    && user.EnableLocalPassword
++                    && _networkManager.IsInLocalNetwork(remoteEndPoint)
++                    && _defaultAuthenticationProvider.VerifyEasyPassword(user, password))
++                {
++                    success = true;
++                    authenticationProvider = _defaultAuthenticationProvider;
++                }
++
+                 if (success && user is not null)
+                 {
+                     // refresh the user if the auth provider might have updated it in the auth method.
+diff --git a/MediaBrowser.Controller/Library/IUserManager.cs b/MediaBrowser.Controller/Library/IUserManager.cs
+index e2b54ea..7657c5e 100644
+--- a/MediaBrowser.Controller/Library/IUserManager.cs
++++ b/MediaBrowser.Controller/Library/IUserManager.cs
+@@ -111,6 +111,14 @@ namespace MediaBrowser.Controller.Library
+         /// <returns>Awaitable task.</returns>
+         Task ChangePassword(Guid userId, string newPassword);
+ 
++        /// <summary>
++        /// Changes the user's easy pin code used for in-network sign-in.
++        /// </summary>
++        /// <param name="userId">The users id.</param>
++        /// <param name="newPassword">New pin code to use, or empty to clear it.</param>
++        /// <returns>Awaitable task.</returns>
++        Task ChangeEasyPassword(Guid userId, string newPassword);
++
+         /// <summary>
+         /// Gets the user dto.
+         /// </summary>
+diff --git a/MediaBrowser.Model/Dto/UserDto.cs b/MediaBrowser.Model/Dto/UserDto.cs
+index c6b4a4d..2e03aa3 100644
+--- a/MediaBrowser.Model/Dto/UserDto.cs
++++ b/MediaBrowser.Model/Dto/UserDto.cs
+@@ -69,7 +69,6 @@ namespace MediaBrowser.Model.Dto
+         /// Gets or sets a value indicating whether this instance has configured easy password.
+         /// </summary>
+         /// <value><c>true</c> if this instance has configured easy password; otherwise, <c>false</c>.</value>
+-        [Obsolete("Easy Password has been replaced with Quick Connect")]
+         public bool? HasConfiguredEasyPassword { get; set; } = false;
+ 
+         /// <summary>
+diff --git a/src/Jellyfin.Database/Jellyfin.Database.Implementations/Entities/User.cs b/src/Jellyfin.Database/Jellyfin.Database.Implementations/Entities/User.cs
+index bf6568d..fb1b209 100644
+--- a/src/Jellyfin.Database/Jellyfin.Database.Implementations/Entities/User.cs
++++ b/src/Jellyfin.Database/Jellyfin.Database.Implementations/Entities/User.cs
+@@ -93,6 +93,16 @@ namespace Jellyfin.Database.Implementations.Entities
+         [StringLength(65535)]
+         public string? Password { get; set; }
+ 
++        /// <summary>
++        /// Gets or sets the user's hashed easy pin code for in-network sign-in, or <c>null</c> if none is set.
++        /// </summary>
++        /// <remarks>
++        /// Max length = 65535.
++        /// </remarks>
++        [MaxLength(65535)]
++        [StringLength(65535)]
++        public string? EasyPassword { get; set; }
++
+         /// <summary>
+         /// Gets or sets a value indicating whether the user must update their password.
+         /// </summary>
+diff --git a/src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/20261111155605_AddEasyPassword.Designer.cs b/src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/20261111155605_AddEasyPassword.Designer.cs
+new file mode 100644
+index 0000000..ce6ce88
+--- /dev/null
++++ b/src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/20261111155605_AddEasyPassword.Designer.cs
+@@ -0,0 +1,1813 @@
++﻿// <auto-generated />
++using System;
++using Jellyfin.Database.Implementations;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Infrastructure;
++using Microsoft.EntityFrameworkCore.Migrations;
++using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
++
++#nullable disable
++
++namespace Jellyfin.Database.Providers.Sqlite.Migrations
++{
++    [DbContext(typeof(JellyfinDbContext))]
++    [Migration("20261111155605_AddEasyPassword")]
++    partial class AddEasyPassword
++    {
++        /// <inheritdoc />
++        protected override void BuildTargetModel(ModelBuilder modelBuilder)
++        {
++#pragma warning disable 612, 618
++            modelBuilder.HasAnnotation("ProductVersion", "10.0.14");
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AccessSchedule", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("DayOfWeek")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<double>("EndHour")
++                        .HasColumnType("REAL");
++
++                    b.Property<double>("StartHour")
++                        .HasColumnType("REAL");
++
++                    b.Property<Guid>("UserId")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("UserId");
++
++                    b.ToTable("AccessSchedules");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ActivityLog", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<DateTime>("DateCreated")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ItemId")
++                        .HasMaxLength(256)
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("LogSeverity")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("Name")
++                        .IsRequired()
++                        .HasMaxLength(512)
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Overview")
++                        .HasMaxLength(512)
++                        .HasColumnType("TEXT");
++
++                    b.Property<uint>("RowVersion")
++                        .IsConcurrencyToken()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("ShortOverview")
++                        .HasMaxLength(512)
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Type")
++                        .IsRequired()
++                        .HasMaxLength(256)
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid>("UserId")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("DateCreated");
++
++                    b.ToTable("ActivityLogs");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AncestorId", b =>
++                {
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid>("ParentItemId")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("ItemId", "ParentItemId");
++
++                    b.HasIndex("ParentItemId");
++
++                    b.ToTable("AncestorIds");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AttachmentStreamInfo", b =>
++                {
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("Index")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("Codec")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("CodecTag")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Comment")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Filename")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("MimeType")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("ItemId", "Index");
++
++                    b.ToTable("AttachmentStreamInfos");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemEntity", b =>
++                {
++                    b.Property<Guid>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Album")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("AlbumArtists")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Artists")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("Audio")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid?>("ChannelId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("CleanName")
++                        .HasColumnType("TEXT");
++
++                    b.Property<float?>("CommunityRating")
++                        .HasColumnType("REAL");
++
++                    b.Property<float?>("CriticRating")
++                        .HasColumnType("REAL");
++
++                    b.Property<string>("CustomRating")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Data")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime?>("DateCreated")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime?>("DateLastMediaAdded")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime?>("DateLastRefreshed")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime?>("DateLastSaved")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime?>("DateModified")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime?>("EndDate")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("EpisodeTitle")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ExternalId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ExternalSeriesId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ExternalServiceId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("ExtraType")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("ForcedSortName")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Genres")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("Height")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("IndexNumber")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("InheritedParentalRatingSubValue")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("InheritedParentalRatingValue")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsFolder")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsInMixedFolder")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsLocked")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsMovie")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsRepeat")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsSeries")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsVirtualItem")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<float?>("LUFS")
++                        .HasColumnType("REAL");
++
++                    b.Property<string>("MediaType")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Name")
++                        .HasColumnType("TEXT");
++
++                    b.Property<float?>("NormalizationGain")
++                        .HasColumnType("REAL");
++
++                    b.Property<string>("OfficialRating")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("OriginalLanguage")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("OriginalTitle")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Overview")
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid?>("OwnerId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid?>("ParentId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("ParentIndexNumber")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("Path")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("PreferredMetadataCountryCode")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("PreferredMetadataLanguage")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime?>("PremiereDate")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("PresentationUniqueKey")
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid?>("PrimaryVersionId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ProductionLocations")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("ProductionYear")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<long?>("RunTimeTicks")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid?>("SeasonId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("SeasonName")
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid?>("SeriesId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("SeriesName")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("SeriesPresentationUniqueKey")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ShowId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<long?>("Size")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("SortName")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime?>("StartDate")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Studios")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Tagline")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Tags")
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid?>("TopParentId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("TotalBitrate")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("Type")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("UnratedType")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("Width")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("Name");
++
++                    b.HasIndex("OwnerId")
++                        .HasFilter("\"OwnerId\" IS NOT NULL");
++
++                    b.HasIndex("ParentId");
++
++                    b.HasIndex("Path");
++
++                    b.HasIndex("PresentationUniqueKey");
++
++                    b.HasIndex("PrimaryVersionId")
++                        .HasFilter("\"PrimaryVersionId\" IS NOT NULL");
++
++                    b.HasIndex("SeasonId");
++
++                    b.HasIndex("SeriesId");
++
++                    b.HasIndex("SeriesName");
++
++                    b.HasIndex("ExtraType", "OwnerId")
++                        .HasFilter("\"ExtraType\" IS NOT NULL");
++
++                    b.HasIndex("TopParentId", "Id");
++
++                    b.HasIndex("Type", "CleanName");
++
++                    b.HasIndex("TopParentId", "Type", "IsVirtualItem")
++                        .HasFilter("\"PrimaryVersionId\" IS NULL AND (\"OwnerId\" IS NULL OR \"ExtraType\" IS NOT NULL)");
++
++                    b.HasIndex("Type", "TopParentId", "Id");
++
++                    b.HasIndex("Type", "TopParentId", "PresentationUniqueKey");
++
++                    b.HasIndex("Type", "TopParentId", "SortName");
++
++                    b.HasIndex("Type", "TopParentId", "StartDate");
++
++                    b.HasIndex("MediaType", "TopParentId", "IsVirtualItem", "PresentationUniqueKey");
++
++                    b.HasIndex("TopParentId", "IsFolder", "IsVirtualItem", "DateCreated");
++
++                    b.HasIndex("TopParentId", "MediaType", "IsVirtualItem", "DateCreated");
++
++                    b.HasIndex("TopParentId", "Type", "IsVirtualItem", "DateCreated");
++
++                    b.HasIndex("Type", "SeriesPresentationUniqueKey", "IsFolder", "IsVirtualItem");
++
++                    b.HasIndex("Type", "SeriesPresentationUniqueKey", "ParentIndexNumber", "IndexNumber");
++
++                    b.HasIndex("Type", "SeriesPresentationUniqueKey", "PresentationUniqueKey", "SortName");
++
++                    b.HasIndex("IsFolder", "TopParentId", "IsVirtualItem", "PresentationUniqueKey", "DateCreated");
++
++                    b.HasIndex("Type", "TopParentId", "IsVirtualItem", "PresentationUniqueKey", "DateCreated");
++
++                    b.ToTable("BaseItems");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++
++                    b.HasData(
++                        new
++                        {
++                            Id = new Guid("00000000-0000-0000-0000-000000000001"),
++                            IsFolder = false,
++                            IsInMixedFolder = false,
++                            IsLocked = false,
++                            IsMovie = false,
++                            IsRepeat = false,
++                            IsSeries = false,
++                            IsVirtualItem = false,
++                            Name = "This is a placeholder item for UserData that has been detached from its original item",
++                            Type = "PLACEHOLDER"
++                        });
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemImageInfo", b =>
++                {
++                    b.Property<Guid>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("TEXT");
++
++                    b.Property<byte[]>("Blurhash")
++                        .HasColumnType("BLOB");
++
++                    b.Property<DateTime?>("DateModified")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("Height")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("ImageType")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Path")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("Width")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("ItemId", "ImageType");
++
++                    b.ToTable("BaseItemImageInfos");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemMetadataField", b =>
++                {
++                    b.Property<int>("Id")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id", "ItemId");
++
++                    b.HasIndex("ItemId");
++
++                    b.ToTable("BaseItemMetadataFields");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemProvider", b =>
++                {
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ProviderId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ProviderValue")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("ItemId", "ProviderId");
++
++                    b.HasIndex("ProviderId", "ItemId", "ProviderValue");
++
++                    b.ToTable("BaseItemProviders");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemTrailerType", b =>
++                {
++                    b.Property<int>("Id")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id", "ItemId");
++
++                    b.HasIndex("ItemId");
++
++                    b.ToTable("BaseItemTrailerTypes");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Chapter", b =>
++                {
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("ChapterIndex")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<DateTime?>("ImageDateModified")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ImagePath")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Name")
++                        .HasColumnType("TEXT");
++
++                    b.Property<long>("StartPositionTicks")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("ItemId", "ChapterIndex");
++
++                    b.ToTable("Chapters");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.CustomItemDisplayPreferences", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("Client")
++                        .IsRequired()
++                        .HasMaxLength(32)
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Key")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid>("UserId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Value")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("UserId", "ItemId", "Client", "Key")
++                        .IsUnique();
++
++                    b.ToTable("CustomItemDisplayPreferences");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.DisplayPreferences", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("ChromecastVersion")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("Client")
++                        .IsRequired()
++                        .HasMaxLength(32)
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("DashboardTheme")
++                        .HasMaxLength(32)
++                        .HasColumnType("TEXT");
++
++                    b.Property<bool>("EnableNextVideoInfoOverlay")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("IndexBy")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("ScrollDirection")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("ShowBackdrop")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("ShowSidebar")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("SkipBackwardLength")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("SkipForwardLength")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("TvHome")
++                        .HasMaxLength(32)
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid>("UserId")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("UserId", "ItemId", "Client")
++                        .IsUnique();
++
++                    b.ToTable("DisplayPreferences");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.HomeSection", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("DisplayPreferencesId")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("Order")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("Type")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("DisplayPreferencesId");
++
++                    b.ToTable("HomeSection");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ImageInfo", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<DateTime>("LastModified")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Path")
++                        .IsRequired()
++                        .HasMaxLength(512)
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid?>("UserId")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("UserId")
++                        .IsUnique();
++
++                    b.ToTable("ImageInfos");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ItemDisplayPreferences", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("Client")
++                        .IsRequired()
++                        .HasMaxLength(32)
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("IndexBy")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<bool>("RememberIndexing")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("RememberSorting")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("SortBy")
++                        .IsRequired()
++                        .HasMaxLength(64)
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("SortOrder")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("UserId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("ViewType")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("UserId");
++
++                    b.ToTable("ItemDisplayPreferences");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ItemValue", b =>
++                {
++                    b.Property<Guid>("ItemValueId")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("CleanValue")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("Type")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("Value")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("ItemValueId");
++
++                    b.HasIndex("Type", "CleanValue");
++
++                    b.HasIndex("Type", "Value")
++                        .IsUnique();
++
++                    b.ToTable("ItemValues");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ItemValueMap", b =>
++                {
++                    b.Property<Guid>("ItemValueId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("ItemValueId", "ItemId");
++
++                    b.HasIndex("ItemId");
++
++                    b.ToTable("ItemValuesMap");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.KeyframeData", b =>
++                {
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.PrimitiveCollection<string>("KeyframeTicks")
++                        .HasColumnType("TEXT");
++
++                    b.Property<long>("TotalDuration")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("ItemId");
++
++                    b.ToTable("KeyframeData");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.LinkedChildEntity", b =>
++                {
++                    b.Property<Guid>("ParentId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("SortOrder")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("ChildId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("ChildType")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("ParentId", "SortOrder");
++
++                    b.HasIndex("ChildId", "ChildType");
++
++                    b.HasIndex("ParentId", "ChildType");
++
++                    b.ToTable("LinkedChildren", (string)null);
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.MediaSegment", b =>
++                {
++                    b.Property<Guid>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("TEXT");
++
++                    b.Property<long>("EndTicks")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("SegmentProviderId")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.Property<long>("StartTicks")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("Type")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("Id");
++
++                    b.ToTable("MediaSegments");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.MediaStreamInfo", b =>
++                {
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("StreamIndex")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("AspectRatio")
++                        .HasColumnType("TEXT");
++
++                    b.Property<float?>("AverageFrameRate")
++                        .HasColumnType("REAL");
++
++                    b.Property<int?>("BitDepth")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("BitRate")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("BlPresentFlag")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("ChannelLayout")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("Channels")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("Codec")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("CodecTag")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("CodecTimeBase")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ColorPrimaries")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ColorSpace")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("ColorTransfer")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Comment")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("DvBlSignalCompatibilityId")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("DvLevel")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("DvProfile")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("DvVersionMajor")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("DvVersionMinor")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("ElPresentFlag")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool?>("Hdr10PlusPresentFlag")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("Height")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool?>("IsAnamorphic")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool?>("IsAvc")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsDefault")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsExternal")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsForced")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool?>("IsHearingImpaired")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool?>("IsInterlaced")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsOriginal")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("KeyFrames")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Language")
++                        .HasColumnType("TEXT");
++
++                    b.Property<float?>("Level")
++                        .HasColumnType("REAL");
++
++                    b.Property<string>("NalLengthSize")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Path")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("PixelFormat")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Profile")
++                        .HasColumnType("TEXT");
++
++                    b.Property<float?>("RealFrameRate")
++                        .HasColumnType("REAL");
++
++                    b.Property<int?>("RefFrames")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("Rotation")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("RpuPresentFlag")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("SampleRate")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("StreamType")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("TimeBase")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Title")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("Width")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("ItemId", "StreamIndex");
++
++                    b.HasIndex("StreamType", "ItemId", "Language", "IsExternal");
++
++                    b.ToTable("MediaStreamInfos");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.People", b =>
++                {
++                    b.Property<Guid>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Name")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("PersonType")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("Name");
++
++                    b.ToTable("Peoples");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.PeopleBaseItemMap", b =>
++                {
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid>("PeopleId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Role")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("ListOrder")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("SortOrder")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("ItemId", "PeopleId", "Role");
++
++                    b.HasIndex("ItemId", "ListOrder");
++
++                    b.HasIndex("ItemId", "SortOrder");
++
++                    b.HasIndex("PeopleId", "ItemId");
++
++                    b.ToTable("PeopleBaseItemMap");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Permission", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("Kind")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<uint>("RowVersion")
++                        .IsConcurrencyToken()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("UserId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<bool>("Value")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("UserId", "Kind")
++                        .IsUnique();
++
++                    b.ToTable("Permissions");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Preference", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("Kind")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<uint>("RowVersion")
++                        .IsConcurrencyToken()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("UserId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Value")
++                        .IsRequired()
++                        .HasMaxLength(65535)
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("UserId", "Kind")
++                        .IsUnique();
++
++                    b.ToTable("Preferences");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Security.ApiKey", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("AccessToken")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime>("DateCreated")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime>("DateLastActivity")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Name")
++                        .IsRequired()
++                        .HasMaxLength(64)
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("AccessToken")
++                        .IsUnique();
++
++                    b.ToTable("ApiKeys");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Security.Device", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("AccessToken")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("AppName")
++                        .IsRequired()
++                        .HasMaxLength(64)
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("AppVersion")
++                        .IsRequired()
++                        .HasMaxLength(32)
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime>("DateCreated")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime>("DateLastActivity")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime>("DateModified")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("DeviceId")
++                        .IsRequired()
++                        .HasMaxLength(256)
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("DeviceName")
++                        .IsRequired()
++                        .HasMaxLength(64)
++                        .HasColumnType("TEXT");
++
++                    b.Property<bool>("IsActive")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<Guid>("UserId")
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("AccessToken", "DateLastActivity");
++
++                    b.HasIndex("DeviceId", "DateLastActivity");
++
++                    b.HasIndex("UserId", "DeviceId");
++
++                    b.ToTable("Devices");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Security.DeviceOptions", b =>
++                {
++                    b.Property<int>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("CustomName")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("DeviceId")
++                        .IsRequired()
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("DeviceId")
++                        .IsUnique();
++
++                    b.ToTable("DeviceOptions");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.TrickplayInfo", b =>
++                {
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("Width")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("Bandwidth")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("Height")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("Interval")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("ThumbnailCount")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("TileHeight")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("TileWidth")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("ItemId", "Width");
++
++                    b.ToTable("TrickplayInfos");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.User", b =>
++                {
++                    b.Property<Guid>("Id")
++                        .ValueGeneratedOnAdd()
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("AudioLanguagePreference")
++                        .HasMaxLength(255)
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("AuthenticationProviderId")
++                        .IsRequired()
++                        .HasMaxLength(255)
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("CastReceiverId")
++                        .HasMaxLength(32)
++                        .HasColumnType("TEXT");
++
++                    b.Property<bool>("DisplayCollectionsView")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("DisplayMissingEpisodes")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("EasyPassword")
++                        .HasMaxLength(65535)
++                        .HasColumnType("TEXT");
++
++                    b.Property<bool>("EnableAutoLogin")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("EnableLocalPassword")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("EnableNextEpisodeAutoPlay")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("EnableUserPreferenceAccess")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("HidePlayedInLatest")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<long>("InternalId")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("InvalidLoginAttemptCount")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<DateTime?>("LastActivityDate")
++                        .HasColumnType("TEXT");
++
++                    b.Property<DateTime?>("LastLoginDate")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("LoginAttemptsBeforeLockout")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("MaxActiveSessions")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("MaxParentalRatingScore")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("MaxParentalRatingSubScore")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("MustUpdatePassword")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("NormalizedUsername")
++                        .IsRequired()
++                        .HasMaxLength(255)
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("Password")
++                        .HasMaxLength(65535)
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("PasswordResetProviderId")
++                        .IsRequired()
++                        .HasMaxLength(255)
++                        .HasColumnType("TEXT");
++
++                    b.Property<bool>("PlayDefaultAudioTrack")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("RememberAudioSelections")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("RememberSubtitleSelections")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int?>("RemoteClientBitrateLimit")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<uint>("RowVersion")
++                        .IsConcurrencyToken()
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("SubtitleLanguagePreference")
++                        .HasMaxLength(255)
++                        .HasColumnType("TEXT");
++
++                    b.Property<int>("SubtitleMode")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("SyncPlayAccess")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<string>("Username")
++                        .IsRequired()
++                        .HasMaxLength(255)
++                        .HasColumnType("TEXT");
++
++                    b.HasKey("Id");
++
++                    b.HasIndex("NormalizedUsername")
++                        .IsUnique();
++
++                    b.HasIndex("Username")
++                        .IsUnique();
++
++                    b.ToTable("Users");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.UserData", b =>
++                {
++                    b.Property<Guid>("ItemId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<Guid>("UserId")
++                        .HasColumnType("TEXT");
++
++                    b.Property<string>("CustomDataKey")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("AudioStreamIndex")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("IsFavorite")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<DateTime?>("LastPlayedDate")
++                        .HasColumnType("TEXT");
++
++                    b.Property<bool?>("Likes")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<int>("PlayCount")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<long>("PlaybackPositionTicks")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<bool>("Played")
++                        .HasColumnType("INTEGER");
++
++                    b.Property<double?>("Rating")
++                        .HasColumnType("REAL");
++
++                    b.Property<DateTime?>("RetentionDate")
++                        .HasColumnType("TEXT");
++
++                    b.Property<int?>("SubtitleStreamIndex")
++                        .HasColumnType("INTEGER");
++
++                    b.HasKey("ItemId", "UserId", "CustomDataKey");
++
++                    b.HasIndex("ItemId", "UserId", "IsFavorite");
++
++                    b.HasIndex("ItemId", "UserId", "LastPlayedDate");
++
++                    b.HasIndex("ItemId", "UserId", "PlaybackPositionTicks");
++
++                    b.HasIndex("ItemId", "UserId", "Played");
++
++                    b.HasIndex("UserId", "IsFavorite", "ItemId");
++
++                    b.HasIndex("UserId", "ItemId", "LastPlayedDate");
++
++                    b.HasIndex("UserId", "Played", "ItemId");
++
++                    b.ToTable("UserData");
++
++                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AccessSchedule", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.User", null)
++                        .WithMany("AccessSchedules")
++                        .HasForeignKey("UserId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AncestorId", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany("Parents")
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "ParentItem")
++                        .WithMany("Children")
++                        .HasForeignKey("ParentItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++
++                    b.Navigation("ParentItem");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AttachmentStreamInfo", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany()
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemEntity", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Owner")
++                        .WithMany("Extras")
++                        .HasForeignKey("OwnerId")
++                        .OnDelete(DeleteBehavior.NoAction);
++
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "DirectParent")
++                        .WithMany("DirectChildren")
++                        .HasForeignKey("ParentId")
++                        .OnDelete(DeleteBehavior.Cascade);
++
++                    b.Navigation("DirectParent");
++
++                    b.Navigation("Owner");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemImageInfo", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany("Images")
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemMetadataField", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany("LockedFields")
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemProvider", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany("Provider")
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemTrailerType", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany("TrailerTypes")
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Chapter", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany("Chapters")
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.DisplayPreferences", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.User", null)
++                        .WithMany("DisplayPreferences")
++                        .HasForeignKey("UserId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.HomeSection", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.DisplayPreferences", null)
++                        .WithMany("HomeSections")
++                        .HasForeignKey("DisplayPreferencesId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ImageInfo", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.User", null)
++                        .WithOne("ProfileImage")
++                        .HasForeignKey("Jellyfin.Database.Implementations.Entities.ImageInfo", "UserId")
++                        .OnDelete(DeleteBehavior.Cascade);
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ItemDisplayPreferences", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.User", null)
++                        .WithMany("ItemDisplayPreferences")
++                        .HasForeignKey("UserId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ItemValueMap", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany("ItemValues")
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.ItemValue", "ItemValue")
++                        .WithMany("BaseItemsMap")
++                        .HasForeignKey("ItemValueId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++
++                    b.Navigation("ItemValue");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.KeyframeData", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany()
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.LinkedChildEntity", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Child")
++                        .WithMany("LinkedChildOfEntities")
++                        .HasForeignKey("ChildId")
++                        .OnDelete(DeleteBehavior.NoAction)
++                        .IsRequired();
++
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Parent")
++                        .WithMany("LinkedChildEntities")
++                        .HasForeignKey("ParentId")
++                        .OnDelete(DeleteBehavior.NoAction)
++                        .IsRequired();
++
++                    b.Navigation("Child");
++
++                    b.Navigation("Parent");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.MediaStreamInfo", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany("MediaStreams")
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.PeopleBaseItemMap", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany("Peoples")
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.People", "People")
++                        .WithMany("BaseItems")
++                        .HasForeignKey("PeopleId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++
++                    b.Navigation("People");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Permission", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.User", null)
++                        .WithMany("Permissions")
++                        .HasForeignKey("UserId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Preference", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.User", null)
++                        .WithMany("Preferences")
++                        .HasForeignKey("UserId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Security.Device", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.User", "User")
++                        .WithMany()
++                        .HasForeignKey("UserId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("User");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.UserData", b =>
++                {
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.BaseItemEntity", "Item")
++                        .WithMany("UserData")
++                        .HasForeignKey("ItemId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.HasOne("Jellyfin.Database.Implementations.Entities.User", "User")
++                        .WithMany()
++                        .HasForeignKey("UserId")
++                        .OnDelete(DeleteBehavior.Cascade)
++                        .IsRequired();
++
++                    b.Navigation("Item");
++
++                    b.Navigation("User");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemEntity", b =>
++                {
++                    b.Navigation("Chapters");
++
++                    b.Navigation("Children");
++
++                    b.Navigation("DirectChildren");
++
++                    b.Navigation("Extras");
++
++                    b.Navigation("Images");
++
++                    b.Navigation("ItemValues");
++
++                    b.Navigation("LinkedChildEntities");
++
++                    b.Navigation("LinkedChildOfEntities");
++
++                    b.Navigation("LockedFields");
++
++                    b.Navigation("MediaStreams");
++
++                    b.Navigation("Parents");
++
++                    b.Navigation("Peoples");
++
++                    b.Navigation("Provider");
++
++                    b.Navigation("TrailerTypes");
++
++                    b.Navigation("UserData");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.DisplayPreferences", b =>
++                {
++                    b.Navigation("HomeSections");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ItemValue", b =>
++                {
++                    b.Navigation("BaseItemsMap");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.People", b =>
++                {
++                    b.Navigation("BaseItems");
++                });
++
++            modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.User", b =>
++                {
++                    b.Navigation("AccessSchedules");
++
++                    b.Navigation("DisplayPreferences");
++
++                    b.Navigation("ItemDisplayPreferences");
++
++                    b.Navigation("Permissions");
++
++                    b.Navigation("Preferences");
++
++                    b.Navigation("ProfileImage");
++                });
++#pragma warning restore 612, 618
++        }
++    }
++}
+diff --git a/src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/20261111155605_AddEasyPassword.cs b/src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/20261111155605_AddEasyPassword.cs
+new file mode 100644
+index 0000000..e8b6698
+--- /dev/null
++++ b/src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/20261111155605_AddEasyPassword.cs
+@@ -0,0 +1,29 @@
++﻿using Microsoft.EntityFrameworkCore.Migrations;
++
++#nullable disable
++
++namespace Jellyfin.Database.Providers.Sqlite.Migrations
++{
++    /// <inheritdoc />
++    public partial class AddEasyPassword : Migration
++    {
++        /// <inheritdoc />
++        protected override void Up(MigrationBuilder migrationBuilder)
++        {
++            migrationBuilder.AddColumn<string>(
++                name: "EasyPassword",
++                table: "Users",
++                type: "TEXT",
++                maxLength: 65535,
++                nullable: true);
++        }
++
++        /// <inheritdoc />
++        protected override void Down(MigrationBuilder migrationBuilder)
++        {
++            migrationBuilder.DropColumn(
++                name: "EasyPassword",
++                table: "Users");
++        }
++    }
++}
+diff --git a/src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/JellyfinDbModelSnapshot.cs b/src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/JellyfinDbModelSnapshot.cs
+index d3df73d2f6c794972c895b18c935c9b8eacf8308..0ad39875dd000eacd0d1f5cf2c3c761a4638bc14 100644
+GIT binary patch
+delta 55
+zcmV-70LcH7`2(o>1F%g30yH9%!39#2WyU;{@T8WL;93T=c>^%4lkf-$1Vv$Ud6S#A
+Nh?5Q=2eYuR<4mT-7;69k
+
+delta 42
+zcmV+_0M-Af`U8{s1F%g30x=?!!39#2`o=ty@T8WL;93T=c>^%4laR3uvrDkuOr@0+
+A761SM
+
+-- 
+2.53.0
+

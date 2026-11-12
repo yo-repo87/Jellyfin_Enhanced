@@ -1,0 +1,218 @@
+From 14e8ea245e6f1078b762ead9731d417499866315 Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <mgibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 23:24:54 +0000
+Subject: [PATCH 5/5] Add bulk metadata editor for batch editing item
+ properties
+
+New dashboard page for bulk editing movie/show metadata: search items,
+then apply updates to genres, tags, official rating, and community rating
+across selected results. Uses library search to find matching items.
+
+Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>
+---
+ .../dashboard/routes/metadata/bulk-editor.tsx | 193 ++++++++++++++++++
+ 1 file changed, 193 insertions(+)
+ create mode 100644 src/apps/dashboard/routes/metadata/bulk-editor.tsx
+
+diff --git a/src/apps/dashboard/routes/metadata/bulk-editor.tsx b/src/apps/dashboard/routes/metadata/bulk-editor.tsx
+new file mode 100644
+index 0000000..03962cc
+--- /dev/null
++++ b/src/apps/dashboard/routes/metadata/bulk-editor.tsx
+@@ -0,0 +1,193 @@
++import React, { useCallback, useState } from 'react';
++import Page from 'components/Page';
++import Box from '@mui/material/Box';
++import Button from '@mui/material/Button';
++import Stack from '@mui/material/Stack';
++import Typography from '@mui/material/Typography';
++import TextField from '@mui/material/TextField';
++import Table from '@mui/material/Table';
++import TableBody from '@mui/material/TableBody';
++import TableCell from '@mui/material/TableCell';
++import TableContainer from '@mui/material/TableContainer';
++import TableHead from '@mui/material/TableHead';
++import TableRow from '@mui/material/TableRow';
++import Paper from '@mui/material/Paper';
++import Loading from 'components/loading/LoadingComponent';
++import SimpleAlert from 'components/SimpleAlert';
++import globalize from 'lib/globalize';
++import { useApi } from 'hooks/useApi';
++import { getLibraryApi } from '@jellyfin/sdk/lib/utils/api/library-api';
++import type { BaseItemDto } from '@jellyfin/sdk/lib/generated-client/models/base-item-dto';
++
++export const Component = () => {
++    const { api } = useApi();
++    const [ selectedItems, setSelectedItems ] = useState<BaseItemDto[]>([]);
++    const [ isLoading, setIsLoading ] = useState(false);
++    const [ isSaving, setIsSaving ] = useState(false);
++    const [ isSuccess, setIsSuccess ] = useState(false);
++    const [ query, setQuery ] = useState('');
++    const [ updates, setUpdates ] = useState({
++        genres: '',
++        tags: '',
++        rating: '',
++        communityRating: ''
++    });
++
++    const onSearch = useCallback(async () => {
++        if (!api || !query.trim()) return;
++
++        setIsLoading(true);
++        try {
++            const result = await getLibraryApi(api).getMediaFolders();
++            const libraryId = result.Items?.[0]?.Id;
++
++            if (libraryId) {
++                const searchResult = await getLibraryApi(api).getItems({
++                    parentId: libraryId,
++                    searchTerm: query,
++                    limit: 100
++                });
++                setSelectedItems(searchResult.Items || []);
++            }
++        } catch (err) {
++            console.error('[BulkMetadataEditor] search failed', err);
++        } finally {
++            setIsLoading(false);
++        }
++    }, [ api, query ]);
++
++    const onSaveChanges = useCallback(async () => {
++        if (!api || selectedItems.length === 0) return;
++
++        setIsSaving(true);
++        try {
++            for (const item of selectedItems) {
++                const updatesObj: Record<string, unknown> = {};
++
++                if (updates.genres) {
++                    updatesObj['Genres'] = updates.genres.split(',').map(g => g.trim());
++                }
++                if (updates.tags) {
++                    updatesObj['Tags'] = updates.tags.split(',').map(t => t.trim());
++                }
++                if (updates.rating) {
++                    updatesObj['OfficialRating'] = updates.rating;
++                }
++                if (updates.communityRating) {
++                    updatesObj['CommunityRating'] = parseFloat(updates.communityRating);
++                }
++
++                if (Object.keys(updatesObj).length > 0) {
++                    await getLibraryApi(api).updateItem({ itemId: item.Id!, body: { ...item, ...updatesObj } });
++                }
++            }
++
++            setIsSuccess(true);
++            setUpdates({ genres: '', tags: '', rating: '', communityRating: '' });
++            setTimeout(() => setIsSuccess(false), 3000);
++        } catch (err) {
++            console.error('[BulkMetadataEditor] save failed', err);
++        } finally {
++            setIsSaving(false);
++        }
++    }, [ api, selectedItems, updates ]);
++
++    return (
++        <Page id='bulkMetadataEditorPage' title={globalize.translate('BulkMetadataEditor')} className='mainAnimatedPage type-interior'>
++            <SimpleAlert
++                open={isSuccess}
++                title={globalize.translate('Success')}
++                text={globalize.translate('MetadataUpdated')}
++                onClose={() => setIsSuccess(false)}
++            />
++
++            <Box sx={{ mb: 4 }}>
++                <Typography variant='h2' sx={{ mb: 2 }}>
++                    {globalize.translate('SearchItems')}
++                </Typography>
++                <Stack direction='row' spacing={2}>
++                    <TextField
++                        label={globalize.translate('SearchQuery')}
++                        value={query}
++                        onChange={(e) => setQuery(e.target.value)}
++                        onKeyDown={(e) => e.key === 'Enter' && onSearch()}
++                        sx={{ flex: 1 }}
++                    />
++                    <Button variant='contained' onClick={onSearch}>
++                        {globalize.translate('Search')}
++                    </Button>
++                </Stack>
++            </Box>
++
++            {isLoading ? (
++                <Loading />
++            ) : selectedItems.length > 0 ? (
++                <Box>
++                    <Typography variant='h2' sx={{ mb: 2 }}>
++                        {globalize.translate('EditMetadata')} ({selectedItems.length} {globalize.translate('Items')})
++                    </Typography>
++
++                    <Stack spacing={2} sx={{ mb: 3 }}>
++                        <TextField
++                            label={globalize.translate('Genres')}
++                            value={updates.genres}
++                            onChange={(e) => setUpdates({ ...updates, genres: e.target.value })}
++                            placeholder='Comedy, Drama, Action'
++                            fullWidth
++                        />
++                        <TextField
++                            label={globalize.translate('Tags')}
++                            value={updates.tags}
++                            onChange={(e) => setUpdates({ ...updates, tags: e.target.value })}
++                            placeholder='tag1, tag2, tag3'
++                            fullWidth
++                        />
++                        <TextField
++                            label={globalize.translate('Rating')}
++                            value={updates.rating}
++                            onChange={(e) => setUpdates({ ...updates, rating: e.target.value })}
++                            placeholder='PG, PG-13, R'
++                            fullWidth
++                        />
++                        <TextField
++                            label={globalize.translate('CommunityRating')}
++                            type='number'
++                            value={updates.communityRating}
++                            onChange={(e) => setUpdates({ ...updates, communityRating: e.target.value })}
++                            inputProps={{ step: 0.1, min: 0, max: 10 }}
++                            fullWidth
++                        />
++                        <Button
++                            variant='contained'
++                            onClick={onSaveChanges}
++                            disabled={isSaving || !Object.values(updates).some(v => v)}
++                        >
++                            {isSaving ? globalize.translate('Saving') : globalize.translate('SaveChanges')}
++                        </Button>
++                    </Stack>
++
++                    <TableContainer component={Paper}>
++                        <Table>
++                            <TableHead>
++                                <TableRow>
++                                    <TableCell>{globalize.translate('Name')}</TableCell>
++                                    <TableCell>{globalize.translate('Type')}</TableCell>
++                                    <TableCell>{globalize.translate('Year')}</TableCell>
++                                </TableRow>
++                            </TableHead>
++                            <TableBody>
++                                {selectedItems.map((item) => (
++                                    <TableRow key={item.Id}>
++                                        <TableCell>{item.Name}</TableCell>
++                                        <TableCell>{item.Type}</TableCell>
++                                        <TableCell>{item.ProductionYear}</TableCell>
++                                    </TableRow>
++                                ))}
++                            </TableBody>
++                        </Table>
++                    </TableContainer>
++                </Box>
++            ) : null}
++        </Page>
++    );
++};
+-- 
+2.53.0
+

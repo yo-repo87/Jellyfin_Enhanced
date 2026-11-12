@@ -1,0 +1,134 @@
+From 1371e67df3f37e620f59fbc0e0204ad2c7bfe537 Mon Sep 17 00:00:00 2001
+From: Matthew Gibson <matthew.gibson041387@gmail.com>
+Date: Wed, 11 Nov 2026 15:54:42 +0000
+Subject: [PATCH 1/5] Add 'copy settings from user' picker to the new-user page
+
+When a source user is selected, library/channel access checkboxes are
+hidden and the server-side copied policy is left untouched.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/apps/dashboard/routes/users/add.tsx | 41 +++++++++++++++++++++++--
+ src/strings/en-us.json                  |  2 ++
+ 2 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/src/apps/dashboard/routes/users/add.tsx b/src/apps/dashboard/routes/users/add.tsx
+index 7581fb8..4681b06 100644
+--- a/src/apps/dashboard/routes/users/add.tsx
++++ b/src/apps/dashboard/routes/users/add.tsx
+@@ -1,5 +1,8 @@
+ import type { BaseItemDto, CreateUserByName } from '@jellyfin/sdk/lib/generated-client';
+ import React, { useCallback, useEffect, useState, useRef } from 'react';
++import TextField from '@mui/material/TextField';
++import MenuItem from '@mui/material/MenuItem';
++import { useUsers } from 'hooks/useUsers';
+ 
+ import globalize from '../../../../lib/globalize';
+ import loading from '../../../../components/loading/loading';
+@@ -27,7 +30,13 @@ const UserNew = () => {
+     const [ channelsItems, setChannelsItems ] = useState<ItemsArr[]>([]);
+     const [ mediaFoldersItems, setMediaFoldersItems ] = useState<ItemsArr[]>([]);
+     const [ isErrorToastOpen, setIsErrorToastOpen ] = useState(false);
++    const [ copyFromUserId, setCopyFromUserId ] = useState('');
+     const element = useRef<HTMLDivElement>(null);
++    const { data: users } = useUsers();
++
++    const handleCopyFromUserChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
++        setCopyFromUserId(e.target.value);
++    }, []);
+ 
+     const handleToastClose = useCallback(() => {
+         setIsErrorToastOpen(false);
+@@ -121,10 +130,14 @@ const UserNew = () => {
+         }
+ 
+         const saveUser = () => {
+-            const userInput: CreateUserByName = {
++            const userInput: CreateUserByName & { CopyFromUserId?: string } = {
+                 Name: (page.querySelector('#txtUsername') as HTMLInputElement).value,
+                 Password: (page.querySelector('#txtPassword') as HTMLInputElement).value
+             };
++            if (copyFromUserId) {
++                userInput.CopyFromUserId = copyFromUserId;
++            }
++
+             createUser.mutate({ createUserByName: userInput }, {
+                 onSuccess: (response) => {
+                     const user = response.data;
+@@ -133,6 +146,12 @@ const UserNew = () => {
+                         throw new Error('Unexpected null user id or policy');
+                     }
+ 
++                    // The copied policy already covers access settings; don't overwrite it
++                    if (copyFromUserId) {
++                        navigate(`/dashboard/users/${user.Id}/profile`);
++                        return;
++                    }
++
+                     user.Policy.EnableAllFolders = (page.querySelector('.chkEnableAllFolders') as HTMLInputElement).checked;
+                     user.Policy.EnabledFolders = [];
+ 
+@@ -208,7 +227,7 @@ const UserNew = () => {
+             (page.querySelector('.newUserProfileForm') as HTMLFormElement).removeEventListener('submit', onSubmit);
+             (page.querySelector('#btnCancel') as HTMLButtonElement).removeEventListener('click', onCancelClick);
+         };
+-    }, [loadUser, createUser, updateUserPolicy, navigate]);
++    }, [loadUser, createUser, updateUserPolicy, navigate, copyFromUserId]);
+ 
+     return (
+         <Page
+@@ -246,6 +265,23 @@ const UserNew = () => {
+                             label={globalize.translate('LabelPassword')}
+                         />
+                     </div>
++                    <div className='inputContainer'>
++                        <TextField
++                            select
++                            fullWidth
++                            id='selectCopyFromUser'
++                            label={globalize.translate('LabelCopySettingsFromUser')}
++                            helperText={globalize.translate('CopySettingsFromUserHelp')}
++                            value={copyFromUserId}
++                            onChange={handleCopyFromUserChange}
++                        >
++                            <MenuItem value=''>{globalize.translate('None')}</MenuItem>
++                            {(users || []).map(u => (
++                                u.Id ? <MenuItem key={u.Id} value={u.Id}>{u.Name}</MenuItem> : null
++                            ))}
++                        </TextField>
++                    </div>
++                    <div style={{ display: copyFromUserId ? 'none' : undefined }}>
+                     <AccessContainer
+                         containerClassName='folderAccessContainer'
+                         headerTitle='HeaderLibraryAccess'
+@@ -285,6 +321,7 @@ const UserNew = () => {
+                             />
+                         ))}
+                     </AccessContainer>
++                    </div>
+                     <div>
+                         <Button
+                             type='submit'
+diff --git a/src/strings/en-us.json b/src/strings/en-us.json
+index d3d75fc..fb4aa4f 100755
+--- a/src/strings/en-us.json
++++ b/src/strings/en-us.json
+@@ -207,6 +207,7 @@
+     "Copied": "Copied",
+     "Copy": "Copy",
+     "CopyFailed": "Could not copy",
++    "CopySettingsFromUserHelp": "Library access, parental controls, and playback preferences will be copied from the selected user.",
+     "CopyStreamURL": "Copy Stream URL",
+     "CopyStreamURLSuccess": "URL copied successfully.",
+     "CopyLogSuccess": "Log contents copied successfully.",
+@@ -697,6 +698,7 @@
+     "LabelCriticRating": "Critics rating",
+     "LabelCurrentPassword": "Current password",
+     "LabelCurrentStatus": "Current status",
++    "LabelCopySettingsFromUser": "Copy settings from user",
+     "LabelCustomCertificatePath": "Custom SSL certificate path",
+     "LabelCustomCertificatePathHelp": "Path to a PKCS #12 file containing a certificate and private key to enable TLS support on a custom domain.",
+     "LabelCustomCss": "Custom CSS code",
+-- 
+2.53.0
+
