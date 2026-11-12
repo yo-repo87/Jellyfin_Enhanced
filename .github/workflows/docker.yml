@@ -1,0 +1,42 @@
+name: Build image
+on:
+  push:
+    branches: [main]
+    paths: ['docker/**', '.github/workflows/docker.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned upstream sources and apply the patches
+        run: |
+          set -e
+          . docker/pins.env
+          git config --global user.email ci@example.invalid; git config --global user.name ci
+          fetch() { git clone -q "$2" "$1" && git -C "$1" checkout -q "$3"; }
+          fetch jellyfin https://github.com/jellyfin/jellyfin.git "$JELLYFIN_REF"
+          fetch jellyfin-web https://github.com/jellyfin/jellyfin-web.git "$JELLYFIN_WEB_REF"
+          fetch jellyfin-plugin-tvdb https://github.com/jellyfin/jellyfin-plugin-tvdb.git "$TVDB_REF"
+          git -C jellyfin am "$PWD"/docker/patches/server/*.patch
+          git -C jellyfin-web am "$PWD"/docker/patches/web/*.patch
+          git -C jellyfin-plugin-tvdb am "$PWD"/docker/patches/tvdb/*.patch
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/yo-repo87/jellyfin-enhanced:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
