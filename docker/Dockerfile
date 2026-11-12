@@ -17,10 +17,10 @@ RUN npm ci --no-audit --no-fund && npm run build:production
 FROM mcr.microsoft.com/dotnet/aspnet:10.0
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg locales \
-      libfontconfig1 libfreetype6 libssl3 mesa-va-drivers \
+      libfontconfig1 libfreetype6 mesa-va-drivers \
  && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg \
  && . /etc/os-release \
- && echo "deb [arch=$TARGETARCH signed-by=/usr/share/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian ${VERSION_CODENAME} main" > /etc/apt/sources.list.d/jellyfin.list \
+ && echo "deb [arch=$TARGETARCH signed-by=/usr/share/keyrings/jellyfin.gpg] https://repo.jellyfin.org/${ID} ${VERSION_CODENAME} main" > /etc/apt/sources.list.d/jellyfin.list \
  && apt-get update && apt-get install -y --no-install-recommends jellyfin-ffmpeg7 \
  && sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen \
  && rm -rf /var/lib/apt/lists/*
